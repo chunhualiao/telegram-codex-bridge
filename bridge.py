@@ -252,15 +252,24 @@ class TelegramCodexBridge:
             self.log_event("WARN", f"Could not edit Telegram message {message_id}: {exc}")
 
     def download_telegram_file(self, file_id: str, dest: Path) -> Path:
-        info = self.telegram_request("getFile", {"file_id": file_id}).get("result") or {}
-        file_path = info.get("file_path")
-        if not file_path:
-            raise RuntimeError("Telegram did not return a file path for the voice message.")
-        url = f"{self.file_base}/{file_path}"
-        with urllib.request.urlopen(url, timeout=self.poll_timeout + 30) as resp:
-            data = resp.read()
-        dest.write_bytes(data)
-        return dest
+        last_error: Exception | None = None
+        for attempt in range(5):
+            try:
+                info = self.telegram_request("getFile", {"file_id": file_id}).get("result") or {}
+                file_path = info.get("file_path")
+                if not file_path:
+                    raise RuntimeError("Telegram did not return a file path for the voice message.")
+                url = f"{self.file_base}/{file_path}"
+                with urllib.request.urlopen(url, timeout=self.poll_timeout + 30) as resp:
+                    data = resp.read()
+                dest.write_bytes(data)
+                return dest
+            except Exception as exc:
+                last_error = exc
+                if attempt == 4:
+                    break
+                time.sleep(1 + attempt)
+        raise RuntimeError(f"Telegram file download failed after retries: {last_error}")
 
     def convert_audio_to_wav(self, source: Path, dest: Path) -> Path:
         cmd = [
