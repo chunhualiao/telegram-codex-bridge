@@ -70,6 +70,7 @@ class TelegramCodexBridge:
         self.thread_file = STATE_DIR / "codex_thread.txt"
         self.lock_file = STATE_DIR / "bridge.lock"
         self.last_activity_file = STATE_DIR / "last_activity.txt"
+        self.lock_notice_file = STATE_DIR / "lock_notice.txt"
         self.transcript_file = STATE_DIR / "conversation.log"
         self.progress_interval = int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "15"))
         self.progress_edit_interval = float(os.environ.get("TELEGRAM_PROGRESS_EDIT_INTERVAL", "2"))
@@ -182,6 +183,23 @@ class TelegramCodexBridge:
         if timestamp is None:
             timestamp = time.time()
         self.last_activity_file.write_text(str(timestamp))
+
+    def load_lock_notice(self) -> float | None:
+        if not self.lock_notice_file.exists():
+            return None
+        raw = self.lock_notice_file.read_text().strip()
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def save_lock_notice(self, timestamp: float | None = None) -> None:
+        if timestamp is None:
+            timestamp = time.time()
+        self.lock_notice_file.write_text(str(timestamp))
+
+    def clear_lock_notice(self) -> None:
+        self.lock_notice_file.unlink(missing_ok=True)
 
     def is_unlock_required(self) -> bool:
         last_activity = self.load_last_activity()
@@ -345,9 +363,14 @@ class TelegramCodexBridge:
         if self.is_unlock_required():
             if text == self.passphrase:
                 self.save_last_activity()
+                self.clear_lock_notice()
                 self.send_message(chat_id, "Unlocked. Session is active again.")
             else:
-                self.send_message(chat_id, "Session locked after inactivity. Send the passphrase to continue.")
+                last_notice = self.load_lock_notice()
+                now = time.time()
+                if last_notice is None or (now - last_notice) >= 60:
+                    self.send_message(chat_id, "Session locked after inactivity. Send the passphrase to continue.")
+                    self.save_lock_notice(now)
             return
         if text:
             self.log_event("USER", text)
