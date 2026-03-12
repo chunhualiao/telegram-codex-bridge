@@ -87,7 +87,7 @@ class TelegramCodexBridge:
         self.acquire_lock()
         self.log_event("SYSTEM", "Bridge started")
         self.send_message(self.allowed_chat_id, "Telegram Codex bridge is online.")
-        offset = self.load_offset()
+        offset = self.skip_startup_backlog(self.load_offset())
         while True:
             try:
                 updates = self.get_updates(offset)
@@ -147,6 +147,21 @@ class TelegramCodexBridge:
 
     def save_offset(self, offset: int) -> None:
         self.offset_file.write_text(str(offset))
+
+    def skip_startup_backlog(self, offset: int) -> int:
+        try:
+            updates = self.get_updates(offset)
+        except Exception as exc:
+            self.log_event("WARN", f"Could not inspect startup backlog: {exc}")
+            return offset
+        if not updates:
+            return offset
+        new_offset = max(update["update_id"] + 1 for update in updates)
+        skipped = len(updates)
+        self.save_offset(new_offset)
+        self.log_event("SYSTEM", f"Skipped {skipped} stale Telegram update(s) from startup backlog")
+        return new_offset
+
 
     def load_thread_id(self) -> str | None:
         if not self.thread_file.exists():
