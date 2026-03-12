@@ -3,6 +3,7 @@ import json
 import os
 import selectors
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -102,6 +103,18 @@ class TelegramCodexBridge:
                 self.log_event("ERROR", f"Telegram polling failed: {exc}")
                 self.send_message(self.allowed_chat_id, f"Bridge error: {exc}")
                 time.sleep(5)
+            except (socket.timeout, TimeoutError) as exc:
+                self.log_event("WARN", f"Telegram polling timed out: {exc}. Retrying.")
+                time.sleep(5)
+                continue
+            except urllib.error.URLError as exc:
+                if "timed out" in str(exc).lower():
+                    self.log_event("WARN", f"Telegram polling timed out: {exc}. Retrying.")
+                    time.sleep(5)
+                    continue
+                self.log_event("ERROR", f"Telegram polling URL error: {exc}")
+                self.send_message(self.allowed_chat_id, f"Bridge error: {exc}")
+                time.sleep(5)
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
@@ -192,7 +205,8 @@ class TelegramCodexBridge:
         try:
             result = self.telegram_request("sendMessage", payload).get("result") or {}
             return result.get("message_id")
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        except Exception as exc:
+            self.log_event("WARN", f"Failed to send Telegram message: {exc}")
             print(f"Failed to send Telegram message: {exc}", file=sys.stderr)
             return None
 
