@@ -682,39 +682,61 @@ class TelegramCodexBridge:
             return candidate
         return current
 
+    def sanitize_usage_snapshot(self, snapshot: dict | None) -> dict | None:
+        if snapshot is None:
+            return None
+        input_tokens = snapshot.get("input_tokens")
+        output_tokens = snapshot.get("output_tokens")
+        total_tokens = snapshot.get("total_tokens")
+        for value in (input_tokens, output_tokens, total_tokens):
+            if value is not None and (not isinstance(value, int) or value < 0):
+                return None
+        # Guard against obviously bogus values from unrelated nested fields.
+        # Even very large Codex turns should be far below these thresholds.
+        if input_tokens is not None and input_tokens > 5_000_000:
+            return None
+        if output_tokens is not None and output_tokens > 1_000_000:
+            return None
+        if total_tokens is not None and total_tokens > 6_000_000:
+            return None
+        return snapshot
+
     def extract_usage_snapshot(self, event: dict) -> dict | None:
-        candidates: list[dict] = []
         input_keys = ("input_tokens", "prompt_tokens")
         output_keys = ("output_tokens", "completion_tokens")
         total_keys = ("total_tokens",)
 
-        def collect(node: object) -> None:
-            if isinstance(node, dict):
-                snapshot = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
-                for key in input_keys:
-                    value = node.get(key)
-                    if isinstance(value, (int, float)):
-                        snapshot["input_tokens"] = int(value)
-                        break
-                for key in output_keys:
-                    value = node.get(key)
-                    if isinstance(value, (int, float)):
-                        snapshot["output_tokens"] = int(value)
-                        break
-                for key in total_keys:
-                    value = node.get(key)
-                    if isinstance(value, (int, float)):
-                        snapshot["total_tokens"] = int(value)
-                        break
-                if any(snapshot.values()):
-                    candidates.append(snapshot)
-                for value in node.values():
-                    collect(value)
-            elif isinstance(node, list):
-                for item in node:
-                    collect(item)
+        def extract_from_node(node: object) -> dict | None:
+            if not isinstance(node, dict):
+                return None
+            snapshot = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+            for key in input_keys:
+                value = node.get(key)
+                if isinstance(value, (int, float)):
+                    snapshot["input_tokens"] = int(value)
+                    break
+            for key in output_keys:
+                value = node.get(key)
+                if isinstance(value, (int, float)):
+                    snapshot["output_tokens"] = int(value)
+                    break
+            for key in total_keys:
+                value = node.get(key)
+                if isinstance(value, (int, float)):
+                    snapshot["total_tokens"] = int(value)
+                    break
+            if any(snapshot.values()):
+                return self.sanitize_usage_snapshot(snapshot)
+            return None
 
-        collect(event)
+        candidates = [
+            extract_from_node(event.get("usage")),
+            extract_from_node(event.get("result")),
+            extract_from_node((event.get("result") or {}).get("usage") if isinstance(event.get("result"), dict) else None),
+            extract_from_node(event.get("item")),
+            extract_from_node((event.get("item") or {}).get("usage") if isinstance(event.get("item"), dict) else None),
+            extract_from_node(event),
+        ]
         best: dict | None = None
         for candidate in candidates:
             best = self.merge_usage_snapshot(best, candidate)
