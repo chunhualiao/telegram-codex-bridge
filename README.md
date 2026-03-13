@@ -167,6 +167,8 @@ TELEGRAM_INACTIVITY_TIMEOUT_SECONDS=3600
 OPENAI_API_KEY=sk-replace_me
 OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
 OPENAI_TRANSCRIBE_PROMPT=The speaker may use Mandarin Chinese, English, or both in the same message. Transcribe both languages accurately. Preserve code, file paths, commands, technical terms, names, and numbers. Keep the transcript faithful to what was said.
+METER_PRICE_LOOKUP=auto
+METER_PRICE_CACHE_TTL_SECONDS=86400
 ```
 
 Minimum required values:
@@ -189,6 +191,21 @@ Recommended values:
 Required for voice support:
 
 - `OPENAI_API_KEY`
+
+Optional for `/meter` API cost estimates:
+
+- `METER_PRICE_LOOKUP=auto`
+  Try OpenAI official pricing first for OpenAI-style model IDs, then OpenRouter as fallback.
+
+- `METER_PRICE_MODEL=<model-id>`
+  Override the detected Codex model if needed.
+
+- `METER_PRICE_CACHE_TTL_SECONDS=86400`
+  Cache pricing lookups locally under `state/pricing_cache.json`.
+
+- `METER_PRICE_INPUT_PER_1M_TOKENS`
+- `METER_PRICE_OUTPUT_PER_1M_TOKENS`
+  Manual fallback only if automatic lookup fails.
 
 Voice transcription defaults:
 
@@ -308,6 +325,9 @@ Supported Telegram commands:
 
 - `/status`
   Shows the saved Codex thread ID, if one exists, plus the configured workdir.
+
+- `/meter`
+  Shows cumulative bridge token counts, how much was exact vs estimated, and estimated API cost when pricing is configured.
 
 - `/reset`
   Deletes the saved Codex thread so the next message starts a fresh Codex session.

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import selectors
 import shlex
 import socket
@@ -17,6 +18,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -46,6 +52,16 @@ def require_env(name: str) -> str:
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def parse_float_env(name: str, default: float = 0.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        raise SystemExit(f"Invalid float value for {name}: {raw}")
 
 
 class TelegramCodexBridge:
@@ -78,11 +94,19 @@ class TelegramCodexBridge:
         self.lock_notice_file = STATE_DIR / "lock_notice.txt"
         self.pending_message_file = STATE_DIR / "pending_message.json"
         self.transcript_file = STATE_DIR / "conversation.log"
+        self.usage_meter_file = STATE_DIR / "usage_meter.json"
+        self.pricing_cache_file = STATE_DIR / "pricing_cache.json"
         self.progress_interval = int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "15"))
         self.progress_edit_interval = float(os.environ.get("TELEGRAM_PROGRESS_EDIT_INTERVAL", "2"))
         self.inactivity_timeout = int(os.environ.get("TELEGRAM_INACTIVITY_TIMEOUT_SECONDS", "3600"))
         self.codex_max_runtime = int(os.environ.get("CODEX_MAX_RUNTIME_SECONDS", "900"))
         self.codex_idle_timeout = int(os.environ.get("CODEX_IDLE_TIMEOUT_SECONDS", "120"))
+        self.meter_price_model = os.environ.get("METER_PRICE_MODEL", "").strip()
+        self.meter_price_input_per_million = parse_float_env("METER_PRICE_INPUT_PER_1M_TOKENS", 0.0)
+        self.meter_price_output_per_million = parse_float_env("METER_PRICE_OUTPUT_PER_1M_TOKENS", 0.0)
+        self.pricing_lookup_preference = os.environ.get("METER_PRICE_LOOKUP", "auto").strip().lower() or "auto"
+        self.pricing_cache_ttl_seconds = int(os.environ.get("METER_PRICE_CACHE_TTL_SECONDS", "86400"))
+        self.detected_model_name = self.detect_model_name()
         self.conflict_exit_threshold = int(
             os.environ.get("TELEGRAM_CONFLICT_EXIT_THRESHOLD", str(DEFAULT_CONFLICT_EXIT_THRESHOLD))
         )
@@ -233,6 +257,28 @@ class TelegramCodexBridge:
         value = self.thread_file.read_text().strip()
         return value or None
 
+    def detect_model_name(self) -> str:
+        for index, flag in enumerate(self.codex_flags):
+            if flag == "--model" and index + 1 < len(self.codex_flags):
+                return self.codex_flags[index + 1]
+            if flag.startswith("--model="):
+                return flag.split("=", 1)[1]
+            if flag == "-m" and index + 1 < len(self.codex_flags):
+                return self.codex_flags[index + 1]
+        env_model = os.environ.get("CODEX_MODEL", "").strip()
+        if env_model:
+            return env_model
+        if tomllib is not None:
+            config_path = Path.home() / ".codex" / "config.toml"
+            try:
+                config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+            except (OSError, tomllib.TOMLDecodeError):
+                config = {}
+            model = config.get("model")
+            if isinstance(model, str) and model.strip():
+                return model.strip()
+        return ""
+
     def load_last_activity(self) -> float | None:
         if not self.last_activity_file.exists():
             return None
@@ -299,6 +345,405 @@ class TelegramCodexBridge:
     def clear_thread_id(self) -> None:
         if self.thread_file.exists():
             self.thread_file.unlink()
+
+    def default_usage_meter(self) -> dict:
+        return {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "exact_input_tokens": 0,
+            "exact_output_tokens": 0,
+            "estimated_input_tokens": 0,
+            "estimated_output_tokens": 0,
+            "input_cost_usd": 0.0,
+            "output_cost_usd": 0.0,
+            "updated_at": 0.0,
+            "last_request": None,
+            "models": {},
+        }
+
+    def load_usage_meter(self) -> dict:
+        if not self.usage_meter_file.exists():
+            return self.default_usage_meter()
+        try:
+            payload = json.loads(self.usage_meter_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return self.default_usage_meter()
+        if not isinstance(payload, dict):
+            return self.default_usage_meter()
+        meter = self.default_usage_meter()
+        meter.update(payload)
+        return meter
+
+    def save_usage_meter(self, meter: dict) -> None:
+        self.usage_meter_file.write_text(json.dumps(meter, indent=2, sort_keys=True), encoding="utf-8")
+
+    def estimate_tokens(self, text: str) -> int:
+        text = text.strip()
+        if not text:
+            return 0
+        return max(1, round(len(text) / 4))
+
+    def calc_token_cost(self, input_tokens: int, output_tokens: int, pricing: dict | None) -> tuple[float, float]:
+        if pricing is None:
+            return 0.0, 0.0
+        input_cost = (input_tokens / 1_000_000) * pricing["input_per_million"]
+        output_cost = (output_tokens / 1_000_000) * pricing["output_per_million"]
+        return input_cost, output_cost
+
+    def normalize_model_name(self, model_name: str) -> str:
+        return re.sub(r"[^a-z0-9./:-]+", "", model_name.strip().lower())
+
+    def get_pricing_model_name(self) -> str:
+        return self.meter_price_model or self.detected_model_name
+
+    def load_pricing_cache(self) -> dict:
+        if not self.pricing_cache_file.exists():
+            return {}
+        try:
+            payload = json.loads(self.pricing_cache_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def save_pricing_cache(self, cache: dict) -> None:
+        self.pricing_cache_file.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+
+    def read_url_text(self, url: str) -> str:
+        req = urllib.request.Request(url, headers={"User-Agent": "telegram-codex-bridge/1.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return resp.read().decode("utf-8", errors="ignore")
+
+    def lookup_manual_pricing(self, model_name: str) -> dict | None:
+        if self.meter_price_input_per_million <= 0.0 and self.meter_price_output_per_million <= 0.0:
+            return None
+        return {
+            "model": model_name,
+            "display_model": model_name,
+            "input_per_million": self.meter_price_input_per_million,
+            "output_per_million": self.meter_price_output_per_million,
+            "source": "manual",
+            "url": "",
+            "fetched_at": time.time(),
+        }
+
+    def choose_pricing_sources(self, model_name: str) -> list[str]:
+        if self.pricing_lookup_preference == "official":
+            return ["official", "openrouter", "manual"]
+        if self.pricing_lookup_preference == "openrouter":
+            return ["openrouter", "official", "manual"]
+        if "/" in model_name:
+            return ["openrouter", "official", "manual"]
+        return ["official", "openrouter", "manual"]
+
+    def lookup_openai_pricing(self, model_name: str) -> dict | None:
+        base_model = model_name.split("/", 1)[1] if model_name.startswith("openai/") else model_name
+        normalized_model = self.normalize_model_name(base_model)
+        if not normalized_model or not (
+            normalized_model.startswith("gpt-")
+            or normalized_model.startswith("o1")
+            or normalized_model.startswith("o3")
+            or normalized_model.startswith("o4")
+        ):
+            return None
+        urls = [
+            f"https://developers.openai.com/api/docs/models/{urllib.parse.quote(base_model)}",
+            "https://openai.com/api/pricing/",
+        ]
+        model_patterns = [re.escape(base_model), re.escape(base_model.replace("-", " "))]
+        for url in urls:
+            try:
+                text = self.read_url_text(url)
+            except Exception:
+                continue
+            compact = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))
+            for pattern in model_patterns:
+                match = re.search(
+                    rf"(?is){pattern}.*?Input[: ]+\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*/\s*1M\s*tokens.*?"
+                    rf"Output[: ]+\$?\s*([0-9]+(?:[.,][0-9]+)?)\s*/\s*1M\s*tokens",
+                    compact,
+                )
+                if not match:
+                    continue
+                input_per_million = float(match.group(1).replace(",", ""))
+                output_per_million = float(match.group(2).replace(",", ""))
+                return {
+                    "model": model_name,
+                    "display_model": base_model,
+                    "input_per_million": input_per_million,
+                    "output_per_million": output_per_million,
+                    "source": "official",
+                    "url": url,
+                    "fetched_at": time.time(),
+                }
+        return None
+
+    def lookup_openrouter_pricing(self, model_name: str) -> dict | None:
+        try:
+            payload = json.loads(self.read_url_text("https://openrouter.ai/api/v1/models"))
+        except Exception:
+            return None
+        models = payload.get("data")
+        if not isinstance(models, list):
+            return None
+        candidates = [model_name]
+        if "/" not in model_name and model_name:
+            candidates.append(f"openai/{model_name}")
+        normalized_candidates = {self.normalize_model_name(candidate) for candidate in candidates}
+        for item in models:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("id") or "").strip()
+            canonical_slug = str(item.get("canonical_slug") or "").strip()
+            names = {
+                self.normalize_model_name(model_id),
+                self.normalize_model_name(canonical_slug),
+            }
+            if not any(name and name in normalized_candidates for name in names):
+                continue
+            pricing = item.get("pricing") or {}
+            prompt = pricing.get("prompt")
+            completion = pricing.get("completion")
+            try:
+                input_per_million = float(prompt) * 1_000_000
+                output_per_million = float(completion) * 1_000_000
+            except (TypeError, ValueError):
+                continue
+            return {
+                "model": model_name,
+                "display_model": model_id or model_name,
+                "input_per_million": input_per_million,
+                "output_per_million": output_per_million,
+                "source": "openrouter",
+                "url": "https://openrouter.ai/api/v1/models",
+                "fetched_at": time.time(),
+            }
+        return None
+
+    def resolve_pricing(self, model_name: str | None = None) -> dict | None:
+        model_name = (model_name or self.get_pricing_model_name()).strip()
+        if not model_name:
+            return self.lookup_manual_pricing("unknown")
+        cache = self.load_pricing_cache()
+        cache_key = self.normalize_model_name(model_name)
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict) and (time.time() - float(cached.get("fetched_at", 0))) < self.pricing_cache_ttl_seconds:
+            return cached
+        for source in self.choose_pricing_sources(model_name):
+            if source == "official":
+                pricing = self.lookup_openai_pricing(model_name)
+            elif source == "openrouter":
+                pricing = self.lookup_openrouter_pricing(model_name)
+            else:
+                pricing = self.lookup_manual_pricing(model_name)
+            if pricing is None:
+                continue
+            cache[cache_key] = pricing
+            self.save_pricing_cache(cache)
+            return pricing
+        return None
+
+    def record_usage(self, usage: dict) -> None:
+        meter = self.load_usage_meter()
+        meter["requests"] += 1
+        meter["input_tokens"] += usage["input_tokens"]
+        meter["output_tokens"] += usage["output_tokens"]
+        meter["exact_input_tokens"] += usage["exact_input_tokens"]
+        meter["exact_output_tokens"] += usage["exact_output_tokens"]
+        meter["estimated_input_tokens"] += usage["estimated_input_tokens"]
+        meter["estimated_output_tokens"] += usage["estimated_output_tokens"]
+        meter["input_cost_usd"] += usage["input_cost_usd"]
+        meter["output_cost_usd"] += usage["output_cost_usd"]
+        meter["updated_at"] = time.time()
+        model_key = usage.get("model") or "unknown"
+        models = meter.get("models")
+        if not isinstance(models, dict):
+            models = {}
+            meter["models"] = models
+        model_meter = models.get(model_key)
+        if not isinstance(model_meter, dict):
+            model_meter = {
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_usd": 0.0,
+                "pricing_source": usage.get("pricing_source") or "unavailable",
+            }
+            models[model_key] = model_meter
+        model_meter["requests"] += 1
+        model_meter["input_tokens"] += usage["input_tokens"]
+        model_meter["output_tokens"] += usage["output_tokens"]
+        model_meter["cost_usd"] += usage["input_cost_usd"] + usage["output_cost_usd"]
+        model_meter["pricing_source"] = usage.get("pricing_source") or model_meter["pricing_source"]
+        meter["last_request"] = {
+            "at": meter["updated_at"],
+            "model": usage.get("model"),
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "exact_input_tokens": usage["exact_input_tokens"],
+            "exact_output_tokens": usage["exact_output_tokens"],
+            "estimated_input_tokens": usage["estimated_input_tokens"],
+            "estimated_output_tokens": usage["estimated_output_tokens"],
+            "input_cost_usd": usage["input_cost_usd"],
+            "output_cost_usd": usage["output_cost_usd"],
+            "outcome": usage["outcome"],
+            "pricing_source": usage.get("pricing_source"),
+            "pricing_url": usage.get("pricing_url"),
+        }
+        self.save_usage_meter(meter)
+
+    def format_usage_report(self) -> str:
+        meter = self.load_usage_meter()
+        total_cost = meter["input_cost_usd"] + meter["output_cost_usd"]
+        pricing = self.resolve_pricing()
+        current_model = self.get_pricing_model_name() or "unknown"
+        lines = [
+            "Bridge meter",
+            f"Detected model: {current_model}",
+            f"Requests: {meter['requests']}",
+            f"Input tokens: {meter['input_tokens']:,}",
+            f"Output tokens: {meter['output_tokens']:,}",
+            (
+                "Exact tokens from Codex events: "
+                f"in {meter['exact_input_tokens']:,}, out {meter['exact_output_tokens']:,}"
+            ),
+            (
+                "Bridge-side estimates used: "
+                f"in {meter['estimated_input_tokens']:,}, out {meter['estimated_output_tokens']:,}"
+            ),
+        ]
+        if pricing is not None:
+            lines.extend(
+                [
+                    f"Estimated API cost total: ${total_cost:.6f}",
+                    (
+                        "Current pricing: "
+                        f"input ${pricing['input_per_million']:.3f}/1M, "
+                        f"output ${pricing['output_per_million']:.3f}/1M"
+                    ),
+                    f"Pricing source: {pricing['source']}",
+                ]
+            )
+            if pricing.get("url"):
+                lines.append(f"Pricing URL: {pricing['url']}")
+        else:
+            lines.append("Estimated API cost: unavailable. Automatic lookup and manual fallback both failed.")
+        models = meter.get("models")
+        if isinstance(models, dict) and models:
+            model_lines = []
+            for model_name, model_meter in sorted(models.items()):
+                if not isinstance(model_meter, dict):
+                    continue
+                model_lines.append(
+                    f"{model_name}: {model_meter.get('requests', 0)} req, "
+                    f"in {model_meter.get('input_tokens', 0):,}, "
+                    f"out {model_meter.get('output_tokens', 0):,}, "
+                    f"${model_meter.get('cost_usd', 0.0):.6f}"
+                )
+            if model_lines:
+                lines.append("Per-model totals:")
+                lines.extend(model_lines[:5])
+        last_request = meter.get("last_request")
+        if isinstance(last_request, dict):
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last_request.get("at", 0)))
+            last_total_cost = last_request.get("input_cost_usd", 0.0) + last_request.get("output_cost_usd", 0.0)
+            lines.extend(
+                [
+                    (
+                        f"Last request: {timestamp} ({last_request.get('outcome', 'unknown')}, "
+                        f"model {last_request.get('model', 'unknown')})"
+                    ),
+                    (
+                        "Last request tokens: "
+                        f"in {last_request.get('input_tokens', 0):,}, "
+                        f"out {last_request.get('output_tokens', 0):,}"
+                    ),
+                ]
+            )
+            if pricing is not None:
+                lines.append(f"Last request estimated API cost: ${last_total_cost:.6f}")
+            if last_request.get("pricing_source"):
+                lines.append(f"Last request pricing source: {last_request['pricing_source']}")
+        lines.append("Source: exact when Codex emits usage fields, otherwise estimated from prompt/reply text.")
+        return "\n".join(lines)
+
+    def merge_usage_snapshot(self, current: dict | None, candidate: dict | None) -> dict | None:
+        if candidate is None:
+            return current
+        if current is None:
+            return candidate
+        current_score = sum(1 for key in ("input_tokens", "output_tokens", "total_tokens") if current.get(key) is not None)
+        candidate_score = sum(
+            1 for key in ("input_tokens", "output_tokens", "total_tokens") if candidate.get(key) is not None
+        )
+        if candidate_score > current_score:
+            return candidate
+        if candidate_score == current_score and (candidate.get("total_tokens") or 0) >= (current.get("total_tokens") or 0):
+            return candidate
+        return current
+
+    def extract_usage_snapshot(self, event: dict) -> dict | None:
+        candidates: list[dict] = []
+        input_keys = ("input_tokens", "prompt_tokens")
+        output_keys = ("output_tokens", "completion_tokens")
+        total_keys = ("total_tokens",)
+
+        def collect(node: object) -> None:
+            if isinstance(node, dict):
+                snapshot = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+                for key in input_keys:
+                    value = node.get(key)
+                    if isinstance(value, (int, float)):
+                        snapshot["input_tokens"] = int(value)
+                        break
+                for key in output_keys:
+                    value = node.get(key)
+                    if isinstance(value, (int, float)):
+                        snapshot["output_tokens"] = int(value)
+                        break
+                for key in total_keys:
+                    value = node.get(key)
+                    if isinstance(value, (int, float)):
+                        snapshot["total_tokens"] = int(value)
+                        break
+                if any(snapshot.values()):
+                    candidates.append(snapshot)
+                for value in node.values():
+                    collect(value)
+            elif isinstance(node, list):
+                for item in node:
+                    collect(item)
+
+        collect(event)
+        best: dict | None = None
+        for candidate in candidates:
+            best = self.merge_usage_snapshot(best, candidate)
+        return best
+
+    def finalize_usage(self, prompt: str, response_text: str, outcome: str, exact_usage: dict | None) -> dict:
+        estimated_input_tokens = self.estimate_tokens(prompt)
+        estimated_output_tokens = self.estimate_tokens(response_text)
+        exact_input_tokens = (exact_usage or {}).get("input_tokens")
+        exact_output_tokens = (exact_usage or {}).get("output_tokens")
+        final_input_tokens = exact_input_tokens if exact_input_tokens is not None else estimated_input_tokens
+        final_output_tokens = exact_output_tokens if exact_output_tokens is not None else estimated_output_tokens
+        model_name = self.get_pricing_model_name() or "unknown"
+        pricing = self.resolve_pricing(model_name)
+        input_cost_usd, output_cost_usd = self.calc_token_cost(final_input_tokens, final_output_tokens, pricing)
+        return {
+            "model": model_name,
+            "input_tokens": final_input_tokens,
+            "output_tokens": final_output_tokens,
+            "exact_input_tokens": exact_input_tokens or 0,
+            "exact_output_tokens": exact_output_tokens or 0,
+            "estimated_input_tokens": 0 if exact_input_tokens is not None else estimated_input_tokens,
+            "estimated_output_tokens": 0 if exact_output_tokens is not None else estimated_output_tokens,
+            "input_cost_usd": input_cost_usd,
+            "output_cost_usd": output_cost_usd,
+            "outcome": outcome,
+            "pricing_source": pricing["source"] if pricing else "unavailable",
+            "pricing_url": pricing["url"] if pricing else "",
+        }
 
     def telegram_request(self, method: str, payload: dict) -> dict:
         data = urllib.parse.urlencode(payload).encode()
@@ -487,13 +932,17 @@ class TelegramCodexBridge:
             self.log_event("USER", "<voice message>")
         if text == "/start":
             self.save_last_activity()
-            self.send_message(chat_id, "Bridge is running. Send a prompt, `/reset`, or `/status`.")
+            self.send_message(chat_id, "Bridge is running. Send a prompt, `/reset`, `/status`, or `/meter`.")
             return
         if text == "/status":
             thread_id = self.load_thread_id()
             status = thread_id if thread_id else "no active Codex thread"
             self.save_last_activity()
             self.send_message(chat_id, f"Status: {status}\nWorkdir: {self.workdir}")
+            return
+        if text == "/meter":
+            self.save_last_activity()
+            self.send_message(chat_id, self.format_usage_report())
             return
         if text == "/reset":
             self.clear_thread_id()
@@ -510,7 +959,8 @@ class TelegramCodexBridge:
                 self.send_message(chat_id, f"Voice transcription failed.\n\n{exc}")
                 return
         status_message_id = self.send_message(chat_id, "Running Codex...")
-        reply = self.run_codex(text, chat_id=chat_id, status_message_id=status_message_id)
+        reply, usage = self.run_codex(text, chat_id=chat_id, status_message_id=status_message_id)
+        self.record_usage(usage)
         self.save_last_activity()
         self.send_message(chat_id, reply)
 
@@ -567,7 +1017,7 @@ class TelegramCodexBridge:
         state["last_text"] = text
         state["last_edit_at"] = now
 
-    def run_codex(self, prompt: str, *, chat_id: str, status_message_id: int | None) -> str:
+    def run_codex(self, prompt: str, *, chat_id: str, status_message_id: int | None) -> tuple[str, dict]:
         with tempfile.NamedTemporaryFile(prefix="codex-last-message-", delete=False) as tmp:
             output_path = tmp.name
         thread_before = self.load_thread_id()
@@ -595,6 +1045,7 @@ class TelegramCodexBridge:
         started_at = time.time()
         last_activity_at = started_at
         timeout_reason: str | None = None
+        exact_usage: dict | None = None
         self.maybe_update_progress(
             chat_id,
             status_message_id,
@@ -619,6 +1070,7 @@ class TelegramCodexBridge:
                         event = json.loads(stripped)
                     except json.JSONDecodeError:
                         continue
+                    exact_usage = self.merge_usage_snapshot(exact_usage, self.extract_usage_snapshot(event))
                     if event.get("type") == "thread.started" and event.get("thread_id"):
                         self.save_thread_id(event["thread_id"])
                     summary = self.summarize_event(event)
@@ -685,6 +1137,7 @@ class TelegramCodexBridge:
         finally:
             Path(output_path).unlink(missing_ok=True)
         if timeout_reason:
+            usage = self.finalize_usage(full_prompt, timeout_reason, "timeout", exact_usage)
             self.maybe_update_progress(
                 chat_id,
                 status_message_id,
@@ -692,10 +1145,12 @@ class TelegramCodexBridge:
                 force=True,
                 state=progress_state,
             )
-            return timeout_reason
+            return timeout_reason, usage
         if proc.returncode != 0:
             tail = output.strip()[-1500:] if output.strip() else "Codex exited without output."
             self.log_event("ERROR", f"Codex command failed: {tail}")
+            failure_message = f"Codex command failed.\n\n{tail}"
+            usage = self.finalize_usage(full_prompt, failure_message, "error", exact_usage)
             self.maybe_update_progress(
                 chat_id,
                 status_message_id,
@@ -703,7 +1158,7 @@ class TelegramCodexBridge:
                 force=True,
                 state=progress_state,
             )
-            return f"Codex command failed.\n\n{tail}"
+            return failure_message, usage
         self.log_event("CODEX", "Codex reply ready")
         self.maybe_update_progress(
             chat_id,
@@ -712,7 +1167,9 @@ class TelegramCodexBridge:
             force=True,
             state=progress_state,
         )
-        return message or "Codex returned an empty message."
+        final_message = message or "Codex returned an empty message."
+        usage = self.finalize_usage(full_prompt, final_message, "ok", exact_usage)
+        return final_message, usage
 
     def maybe_capture_thread_id(self, output: str) -> None:
         for line in output.splitlines():

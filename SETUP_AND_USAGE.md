@@ -164,6 +164,21 @@ Typical values include:
 - `TELEGRAM_INACTIVITY_TIMEOUT_SECONDS=3600`
   Lock the bridge after one hour without accepted activity.
 
+- `METER_PRICE_LOOKUP=auto`
+  Automatic pricing lookup for `/meter`. OpenAI-style model IDs try official OpenAI pricing first, then OpenRouter.
+
+- `METER_PRICE_MODEL=gpt-5.4`
+  Optional model override if the bridge cannot detect the Codex model on its own.
+
+- `METER_PRICE_CACHE_TTL_SECONDS=86400`
+  Cache pricing lookups under `state/pricing_cache.json` for one day.
+
+- `METER_PRICE_INPUT_PER_1M_TOKENS=1.25`
+  Optional manual input-token fallback if automatic lookup fails.
+
+- `METER_PRICE_OUTPUT_PER_1M_TOKENS=10.00`
+  Optional manual output-token fallback if automatic lookup fails.
+
 ## Prerequisites
 
 The bridge depends on these local capabilities:
@@ -272,7 +287,7 @@ If Codex fails:
 
 ## Supported Telegram Commands
 
-The bridge currently supports three explicit commands.
+The bridge currently supports four explicit commands.
 
 ### `/start`
 
@@ -282,7 +297,7 @@ Returns a short readiness message.
 Expected response:
 
 ```text
-Bridge is running. Send a prompt, `/reset`, or `/status`.
+Bridge is running. Send a prompt, `/reset`, `/status`, or `/meter`.
 ```
 
 ### `/status`
@@ -303,6 +318,17 @@ Expected response when a thread exists:
 Status: <thread-id>
 Workdir: /path/to/workdir
 ```
+
+### `/meter`
+
+Purpose:
+Shows cumulative bridge-side token usage meters.
+
+Response includes:
+
+- total input and output tokens
+- how many tokens came from exact Codex usage fields versus bridge-side estimates
+- estimated API cost with automatic pricing lookup from OpenAI/OpenRouter, or the manual fallback values if lookup fails
 
 ### `/reset`
 
