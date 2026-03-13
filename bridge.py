@@ -76,6 +76,7 @@ class TelegramCodexBridge:
         self.lock_file = STATE_DIR / "bridge.lock"
         self.last_activity_file = STATE_DIR / "last_activity.txt"
         self.lock_notice_file = STATE_DIR / "lock_notice.txt"
+        self.pending_message_file = STATE_DIR / "pending_message.json"
         self.transcript_file = STATE_DIR / "conversation.log"
         self.progress_interval = int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "15"))
         self.progress_edit_interval = float(os.environ.get("TELEGRAM_PROGRESS_EDIT_INTERVAL", "2"))
@@ -98,6 +99,7 @@ class TelegramCodexBridge:
 
     def run(self) -> None:
         self.acquire_lock()
+        self.reset_unlock_state_for_restart()
         self.log_event("SYSTEM", "Bridge started")
         offset = self.verify_polling_ready(self.load_offset())
         self.send_message(self.allowed_chat_id, "Telegram Codex bridge is online.")
@@ -245,6 +247,9 @@ class TelegramCodexBridge:
             timestamp = time.time()
         self.last_activity_file.write_text(str(timestamp))
 
+    def clear_last_activity(self) -> None:
+        self.last_activity_file.unlink(missing_ok=True)
+
     def load_lock_notice(self) -> float | None:
         if not self.lock_notice_file.exists():
             return None
@@ -261,6 +266,26 @@ class TelegramCodexBridge:
 
     def clear_lock_notice(self) -> None:
         self.lock_notice_file.unlink(missing_ok=True)
+
+    def load_pending_message(self) -> dict | None:
+        if not self.pending_message_file.exists():
+            return None
+        try:
+            payload = json.loads(self.pending_message_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            self.pending_message_file.unlink(missing_ok=True)
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def save_pending_message(self, message: dict) -> None:
+        self.pending_message_file.write_text(json.dumps(message), encoding="utf-8")
+
+    def clear_pending_message(self) -> None:
+        self.pending_message_file.unlink(missing_ok=True)
+
+    def reset_unlock_state_for_restart(self) -> None:
+        self.clear_last_activity()
+        self.clear_lock_notice()
 
     def is_unlock_required(self) -> bool:
         last_activity = self.load_last_activity()
@@ -435,13 +460,27 @@ class TelegramCodexBridge:
                 self.save_last_activity()
                 self.clear_lock_notice()
                 self.send_message(chat_id, "Unlocked. Session is active again.")
+                pending_message = self.load_pending_message()
+                if pending_message:
+                    self.clear_pending_message()
+                    self.process_message(chat_id, pending_message)
             else:
+                self.save_pending_message(message)
                 last_notice = self.load_lock_notice()
                 now = time.time()
                 if last_notice is None or (now - last_notice) >= 60:
-                    self.send_message(chat_id, "Session locked after inactivity. Send the passphrase to continue.")
+                    self.send_message(
+                        chat_id,
+                        "Session locked after inactivity. Send the passphrase to continue. "
+                        "Your last message is queued and will run after unlock.",
+                    )
                     self.save_lock_notice(now)
             return
+        self.process_message(chat_id, message)
+
+    def process_message(self, chat_id: str, message: dict) -> None:
+        text = (message.get("text") or "").strip()
+        has_voice = bool(message.get("voice") or message.get("audio"))
         if text:
             self.log_event("USER", text)
         elif has_voice:
