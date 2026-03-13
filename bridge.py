@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import json
 import os
 import selectors
@@ -9,6 +11,8 @@ import sys
 import tempfile
 import time
 import atexit
+import fcntl
+import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 ENV_PATH = BASE_DIR / ".env"
 DEFAULT_POLL_TIMEOUT = 30
+DEFAULT_CONFLICT_EXIT_THRESHOLD = 3
 
 
 def load_env_file(path: Path) -> None:
@@ -77,6 +82,13 @@ class TelegramCodexBridge:
         self.inactivity_timeout = int(os.environ.get("TELEGRAM_INACTIVITY_TIMEOUT_SECONDS", "3600"))
         self.codex_max_runtime = int(os.environ.get("CODEX_MAX_RUNTIME_SECONDS", "900"))
         self.codex_idle_timeout = int(os.environ.get("CODEX_IDLE_TIMEOUT_SECONDS", "120"))
+        self.conflict_exit_threshold = int(
+            os.environ.get("TELEGRAM_CONFLICT_EXIT_THRESHOLD", str(DEFAULT_CONFLICT_EXIT_THRESHOLD))
+        )
+        token_fingerprint = hashlib.sha256(self.bot_token.encode("utf-8")).hexdigest()[:16]
+        self.global_lock_dir = Path.home() / ".telegram-bridge-locks"
+        self.global_lock_file = self.global_lock_dir / f"{token_fingerprint}.lock"
+        self.global_lock_handle = None
 
     def log_event(self, kind: str, text: str) -> None:
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {kind}: {text}".replace("\r", " ").strip()
@@ -87,18 +99,30 @@ class TelegramCodexBridge:
     def run(self) -> None:
         self.acquire_lock()
         self.log_event("SYSTEM", "Bridge started")
+        offset = self.verify_polling_ready(self.load_offset())
         self.send_message(self.allowed_chat_id, "Telegram Codex bridge is online.")
-        offset = self.skip_startup_backlog(self.load_offset())
+        conflict_count = 0
         while True:
             try:
                 updates = self.get_updates(offset)
+                conflict_count = 0
                 for update in updates:
                     offset = max(offset, update["update_id"] + 1)
                     self.save_offset(offset)
                     self.handle_update(update)
             except urllib.error.HTTPError as exc:
                 if exc.code == 409:
-                    self.log_event("WARN", "Telegram getUpdates conflict; another poller is or was active. Retrying.")
+                    conflict_count += 1
+                    self.log_event(
+                        "ERROR" if conflict_count >= self.conflict_exit_threshold else "WARN",
+                        "Telegram getUpdates conflict; another poller is using this bot token "
+                        f"({conflict_count}/{self.conflict_exit_threshold}).",
+                    )
+                    if conflict_count >= self.conflict_exit_threshold:
+                        raise SystemExit(
+                            "Telegram getUpdates conflict persisted. "
+                            "Another process is polling the same bot token."
+                        )
                     time.sleep(5)
                     continue
                 self.log_event("ERROR", f"Telegram polling failed: {exc}")
@@ -124,6 +148,7 @@ class TelegramCodexBridge:
                 time.sleep(5)
 
     def acquire_lock(self) -> None:
+        self.acquire_global_lock()
         if self.lock_file.exists():
             pid_text = self.lock_file.read_text().strip()
             if pid_text.isdigit():
@@ -139,6 +164,36 @@ class TelegramCodexBridge:
 
     def release_lock(self) -> None:
         self.lock_file.unlink(missing_ok=True)
+        if self.global_lock_handle is not None:
+            try:
+                fcntl.flock(self.global_lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                self.global_lock_handle.close()
+            except OSError:
+                pass
+            self.global_lock_handle = None
+        self.global_lock_file.unlink(missing_ok=True)
+
+    def acquire_global_lock(self) -> None:
+        self.global_lock_dir.mkdir(parents=True, exist_ok=True)
+        handle = self.global_lock_file.open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            owner = handle.read().strip() or "unknown owner"
+            handle.close()
+            raise SystemExit(
+                "Another local process already owns this Telegram bot token lock "
+                f"({self.global_lock_file}): {owner}"
+            )
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid={os.getpid()} repo={BASE_DIR}\n")
+        handle.flush()
+        self.global_lock_handle = handle
 
     def load_offset(self) -> int:
         if not self.offset_file.exists():
@@ -149,9 +204,15 @@ class TelegramCodexBridge:
     def save_offset(self, offset: int) -> None:
         self.offset_file.write_text(str(offset))
 
-    def skip_startup_backlog(self, offset: int) -> int:
+    def verify_polling_ready(self, offset: int) -> int:
         try:
-            updates = self.get_updates(offset)
+            updates = self.get_updates(offset, timeout=0)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                raise SystemExit(
+                    "Startup failed: another process is already polling this Telegram bot token."
+                ) from exc
+            raise
         except Exception as exc:
             self.log_event("WARN", f"Could not inspect startup backlog: {exc}")
             return offset
@@ -224,9 +285,9 @@ class TelegramCodexBridge:
             raise RuntimeError(f"Telegram API error for {method}: {body}")
         return parsed
 
-    def get_updates(self, offset: int) -> list[dict]:
+    def get_updates(self, offset: int, timeout: int | None = None) -> list[dict]:
         payload = {
-            "timeout": str(self.poll_timeout),
+            "timeout": str(self.poll_timeout if timeout is None else timeout),
             "offset": str(offset),
             "allowed_updates": json.dumps(["message"]),
         }

@@ -231,7 +231,11 @@ If that `curl` fails, the bridge will not work.
    On later messages it runs `codex exec resume <thread_id>`.
 
 13. Handles Telegram polling conflicts
-   If Telegram returns `HTTP 409 Conflict`, the bridge treats that as a duplicate poller problem and retries quietly instead of spamming the chat.
+   The bridge keeps a machine-wide lock for the Telegram bot token under
+   `~/.telegram-bridge-locks/` so different repos cannot poll the same bot at
+   the same time on one machine. If Telegram still returns `HTTP 409 Conflict`,
+   the bridge treats that as a duplicate poller problem and exits after a few
+   retries instead of looking healthy while never receiving updates.
 
 ## Exact Codex Behavior
 
@@ -620,7 +624,9 @@ What to do:
 1. List all bridge processes.
 2. Kill all of them.
 3. Remove `state/bridge.lock`.
-4. Start exactly one bridge process.
+4. If needed, remove the matching token lock under `~/.telegram-bridge-locks/`
+   only after confirming no bridge process is still alive.
+5. Start exactly one bridge process.
 
 Do not start another instance until you have confirmed the first one exited cleanly.
 

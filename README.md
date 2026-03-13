@@ -425,6 +425,10 @@ rm -f state/bridge.lock
 python3 bridge.py
 ```
 
+The bridge now also keeps a machine-wide lock for the Telegram bot token under
+`~/.telegram-bridge-locks/`. That prevents different bridge repos from polling
+the same bot token at the same time.
+
 ### Telegram says `409 Conflict`
 
 Cause:
@@ -435,7 +439,13 @@ Fix:
 
 1. Kill every running `bridge.py` process.
 2. Remove `state/bridge.lock`.
-3. Start exactly one new bridge process.
+3. If needed, remove the matching token lock under `~/.telegram-bridge-locks/`
+   only after you verify no bridge process is still running.
+4. Start exactly one new bridge process.
+
+The bridge now fails fast on repeated `409 Conflict` responses instead of
+looping forever. It also waits until polling is confirmed before sending the
+`Telegram Codex bridge is online.` message.
 
 ### Codex argument parsing fails
 
