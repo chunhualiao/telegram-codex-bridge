@@ -70,6 +70,29 @@ class UsageSnapshotExtractionTests(unittest.TestCase):
             },
         )
 
+    def test_ignores_non_usage_token_fields_in_event_and_item(self) -> None:
+        bridge = make_bridge()
+        event = {
+            "type": "item.completed",
+            "input_tokens": 83_430_095,
+            "output_tokens": 293_617,
+            "result": {
+                "type": "command_execution",
+                "input_tokens": 7_654_321,
+                "output_tokens": 12_345,
+            },
+            "item": {
+                "type": "agent_message",
+                "text": "synthetic reply",
+                "input_tokens": 6_543_210,
+                "output_tokens": 54_321,
+            },
+        }
+
+        snapshot = bridge.extract_usage_snapshot(event)
+
+        self.assertIsNone(snapshot)
+
 
 class FinalizeUsageTests(unittest.TestCase):
     def test_finalize_usage_uses_exact_counts_when_present(self) -> None:

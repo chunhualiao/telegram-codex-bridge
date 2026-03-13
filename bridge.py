@@ -731,11 +731,8 @@ class TelegramCodexBridge:
 
         candidates = [
             extract_from_node(event.get("usage")),
-            extract_from_node(event.get("result")),
             extract_from_node((event.get("result") or {}).get("usage") if isinstance(event.get("result"), dict) else None),
-            extract_from_node(event.get("item")),
             extract_from_node((event.get("item") or {}).get("usage") if isinstance(event.get("item"), dict) else None),
-            extract_from_node(event),
         ]
         best: dict | None = None
         for candidate in candidates:
