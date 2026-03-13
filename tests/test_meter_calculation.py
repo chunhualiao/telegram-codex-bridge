@@ -158,5 +158,44 @@ class FinalizeUsageTests(unittest.TestCase):
         self.assertAlmostEqual(usage["output_cost_usd"], 0.001332)
 
 
+class TimeoutDiagnosticsTests(unittest.TestCase):
+    def test_format_recent_output_tail_trims_and_skips_blank_lines(self) -> None:
+        bridge = make_bridge()
+        long_line = "x" * 300
+
+        tail = bridge.format_recent_output_tail(["\n", " short line \n", long_line])
+
+        self.assertEqual(tail, f"short line | {'x' * 237}...")
+
+    def test_build_timeout_diagnostics_includes_last_event_and_tail(self) -> None:
+        bridge = make_bridge()
+        diagnostics = bridge.build_timeout_diagnostics(
+            elapsed=142,
+            quiet_for=120,
+            last_event_at=1_773_407_547.0,
+            last_event_summary="item.completed (command_execution)",
+            recent_output_tail=['{"type":"item.completed"}\n', "plain text line\n"],
+        )
+
+        self.assertIn("Elapsed: 142s", diagnostics)
+        self.assertIn("Silent for: 120s", diagnostics)
+        self.assertIn("Last Codex event:", diagnostics)
+        self.assertIn("item.completed (command_execution)", diagnostics)
+        self.assertIn('{"type":"item.completed"} | plain text line', diagnostics)
+
+    def test_build_timeout_diagnostics_handles_missing_event_context(self) -> None:
+        bridge = make_bridge()
+        diagnostics = bridge.build_timeout_diagnostics(
+            elapsed=30,
+            quiet_for=30,
+            last_event_at=None,
+            last_event_summary=None,
+            recent_output_tail=[],
+        )
+
+        self.assertIn("Last Codex event: none captured", diagnostics)
+        self.assertIn("Recent output tail: none", diagnostics)
+
+
 if __name__ == "__main__":
     unittest.main()

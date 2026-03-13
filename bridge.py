@@ -17,6 +17,7 @@ import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from pathlib import Path
 
 try:
@@ -120,6 +121,51 @@ class TelegramCodexBridge:
         print(line, flush=True)
         with self.transcript_file.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+
+    def format_recent_output_tail(self, lines: list[str]) -> str:
+        snippets: list[str] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if len(line) > 240:
+                line = line[:237] + "..."
+            snippets.append(line)
+        if not snippets:
+            return "none"
+        return " | ".join(snippets)
+
+    def summarize_event_brief(self, event: dict) -> str:
+        event_type = str(event.get("type") or "unknown")
+        item = event.get("item")
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if item_type:
+            return f"{event_type} ({item_type})"
+        return event_type
+
+    def build_timeout_diagnostics(
+        self,
+        *,
+        elapsed: int,
+        quiet_for: int,
+        last_event_at: float | None,
+        last_event_summary: str | None,
+        recent_output_tail: list[str],
+    ) -> str:
+        lines = [
+            f"Elapsed: {elapsed}s",
+            f"Silent for: {quiet_for}s",
+        ]
+        if last_event_at is not None:
+            lines.append(
+                "Last Codex event: "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(last_event_at))} "
+                f"({last_event_summary or 'unknown'})"
+            )
+        else:
+            lines.append("Last Codex event: none captured")
+        lines.append(f"Recent output tail: {self.format_recent_output_tail(recent_output_tail)}")
+        return "\n".join(lines)
 
     def run(self) -> None:
         self.acquire_lock()
@@ -1113,10 +1159,14 @@ class TelegramCodexBridge:
         assert proc.stdout is not None
         selector.register(proc.stdout, selectors.EVENT_READ)
         output_lines: list[str] = []
+        recent_output_tail: deque[str] = deque(maxlen=8)
         progress_state = {"last_text": "", "last_edit_at": 0.0}
         started_at = time.time()
         last_activity_at = started_at
+        last_event_at: float | None = None
+        last_event_summary: str | None = None
         timeout_reason: str | None = None
+        timeout_details: str | None = None
         exact_usage: dict | None = None
         self.maybe_update_progress(
             chat_id,
@@ -1134,6 +1184,7 @@ class TelegramCodexBridge:
                         selector.unregister(key.fileobj)
                         continue
                     output_lines.append(line)
+                    recent_output_tail.append(line)
                     last_activity_at = time.time()
                     stripped = line.strip()
                     if not stripped.startswith("{"):
@@ -1143,6 +1194,8 @@ class TelegramCodexBridge:
                     except json.JSONDecodeError:
                         continue
                     exact_usage = self.merge_usage_snapshot(exact_usage, self.extract_usage_snapshot(event))
+                    last_event_at = last_activity_at
+                    last_event_summary = self.summarize_event_brief(event)
                     if event.get("type") == "thread.started" and event.get("thread_id"):
                         self.save_thread_id(event["thread_id"])
                     summary = self.summarize_event(event)
@@ -1162,7 +1215,15 @@ class TelegramCodexBridge:
                 timeout_reason = (
                     f"Codex exceeded the maximum runtime of {self.codex_max_runtime}s and was stopped."
                 )
+                timeout_details = self.build_timeout_diagnostics(
+                    elapsed=elapsed,
+                    quiet_for=quiet_for,
+                    last_event_at=last_event_at,
+                    last_event_summary=last_event_summary,
+                    recent_output_tail=list(recent_output_tail),
+                )
                 self.log_event("ERROR", timeout_reason)
+                self.log_event("ERROR", f"Timeout diagnostics:\n{timeout_details}")
                 self.maybe_update_progress(
                     chat_id,
                     status_message_id,
@@ -1175,7 +1236,15 @@ class TelegramCodexBridge:
                 timeout_reason = (
                     f"Codex produced no output for {self.codex_idle_timeout}s and was stopped."
                 )
+                timeout_details = self.build_timeout_diagnostics(
+                    elapsed=elapsed,
+                    quiet_for=quiet_for,
+                    last_event_at=last_event_at,
+                    last_event_summary=last_event_summary,
+                    recent_output_tail=list(recent_output_tail),
+                )
                 self.log_event("ERROR", timeout_reason)
+                self.log_event("ERROR", f"Timeout diagnostics:\n{timeout_details}")
                 self.maybe_update_progress(
                     chat_id,
                     status_message_id,
@@ -1211,7 +1280,10 @@ class TelegramCodexBridge:
             if temp_dir_obj is not None:
                 temp_dir_obj.cleanup()
         if timeout_reason:
-            usage = self.finalize_usage(full_prompt, timeout_reason, "timeout", exact_usage)
+            timeout_message = timeout_reason
+            if timeout_details:
+                timeout_message = f"{timeout_reason}\n\n{timeout_details}"
+            usage = self.finalize_usage(full_prompt, timeout_message, "timeout", exact_usage)
             self.maybe_update_progress(
                 chat_id,
                 status_message_id,
@@ -1219,11 +1291,23 @@ class TelegramCodexBridge:
                 force=True,
                 state=progress_state,
             )
-            return timeout_reason, usage
+            return timeout_message, usage
         if proc.returncode != 0:
             tail = output.strip()[-1500:] if output.strip() else "Codex exited without output."
-            self.log_event("ERROR", f"Codex command failed: {tail}")
-            failure_message = f"Codex command failed.\n\n{tail}"
+            command_failed_message = f"Codex command failed.\n\n{tail}"
+            if last_event_at is not None or recent_output_tail:
+                failure_details = self.build_timeout_diagnostics(
+                    elapsed=int(time.time() - started_at),
+                    quiet_for=int(time.time() - last_activity_at),
+                    last_event_at=last_event_at,
+                    last_event_summary=last_event_summary,
+                    recent_output_tail=list(recent_output_tail),
+                )
+                self.log_event("ERROR", f"Codex command failed: {tail}\n\n{failure_details}")
+                failure_message = f"{command_failed_message}\n\n{failure_details}"
+            else:
+                self.log_event("ERROR", f"Codex command failed: {tail}")
+                failure_message = command_failed_message
             usage = self.finalize_usage(full_prompt, failure_message, "error", exact_usage)
             self.maybe_update_progress(
                 chat_id,
