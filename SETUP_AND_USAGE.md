@@ -228,7 +228,7 @@ If that `curl` fails, the bridge will not work.
    It repeatedly calls the Telegram Bot API `getUpdates`.
 
 7. Filters messages
-   It only handles text or voice messages from the configured `TELEGRAM_ALLOWED_CHAT_ID` and `TELEGRAM_ALLOWED_USER_ID`, and only in a private chat.
+   It only handles text, image, or voice messages from the configured `TELEGRAM_ALLOWED_CHAT_ID` and `TELEGRAM_ALLOWED_USER_ID`, and only in a private chat.
 
 8. Enforces inactivity locking
    If there has been no accepted activity for the configured timeout, the next message must be the configured passphrase before normal commands resume.

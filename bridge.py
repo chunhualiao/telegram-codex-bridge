@@ -802,6 +802,33 @@ class TelegramCodexBridge:
                 time.sleep(1 + attempt)
         raise RuntimeError(f"Telegram file download failed after retries: {last_error}")
 
+    def is_image_document(self, message: dict) -> bool:
+        document = message.get("document") or {}
+        mime_type = str(document.get("mime_type") or "").lower()
+        return mime_type.startswith("image/")
+
+    def has_image(self, message: dict) -> bool:
+        return bool(message.get("photo")) or self.is_image_document(message)
+
+    def download_image_from_message(self, message: dict, dest_dir: Path) -> Path:
+        photo_sizes = message.get("photo") or []
+        document = message.get("document") or {}
+        file_id = ""
+        suffix = ".jpg"
+        if photo_sizes:
+            largest = photo_sizes[-1]
+            file_id = str(largest.get("file_id") or "")
+            suffix = ".jpg"
+        elif self.is_image_document(message):
+            file_id = str(document.get("file_id") or "")
+            file_name = str(document.get("file_name") or "")
+            suffix = Path(file_name).suffix or ".img"
+        if not file_id:
+            raise RuntimeError("Telegram image payload did not include a file_id.")
+        image_path = dest_dir / f"telegram-image{suffix}"
+        self.download_telegram_file(file_id, image_path)
+        return image_path
+
     def convert_audio_to_wav(self, source: Path, dest: Path) -> Path:
         cmd = [
             "ffmpeg",
@@ -891,13 +918,14 @@ class TelegramCodexBridge:
         chat_id = str(chat.get("id", ""))
         user_id = str(user.get("id", ""))
         chat_type = str(chat.get("type", ""))
-        text = (message.get("text") or "").strip()
+        text = (message.get("text") or message.get("caption") or "").strip()
         has_voice = bool(message.get("voice") or message.get("audio"))
+        has_image = self.has_image(message)
         if (
             chat_type != "private"
             or chat_id != self.allowed_chat_id
             or user_id != self.allowed_user_id
-            or (not text and not has_voice)
+            or (not text and not has_voice and not has_image)
         ):
             return
         if self.is_unlock_required():
@@ -924,12 +952,15 @@ class TelegramCodexBridge:
         self.process_message(chat_id, message)
 
     def process_message(self, chat_id: str, message: dict) -> None:
-        text = (message.get("text") or "").strip()
+        text = (message.get("text") or message.get("caption") or "").strip()
         has_voice = bool(message.get("voice") or message.get("audio"))
+        has_image = self.has_image(message)
         if text:
             self.log_event("USER", text)
         elif has_voice:
             self.log_event("USER", "<voice message>")
+        elif has_image:
+            self.log_event("USER", "<image message>")
         if text == "/start":
             self.save_last_activity()
             self.send_message(chat_id, "Bridge is running. Send a prompt, `/reset`, `/status`, or `/meter`.")
@@ -958,18 +989,27 @@ class TelegramCodexBridge:
                 self.log_event("ERROR", f"Voice transcription failed: {exc}")
                 self.send_message(chat_id, f"Voice transcription failed.\n\n{exc}")
                 return
+        if has_image and not text:
+            text = "Please inspect the attached image and describe or answer based on it."
         status_message_id = self.send_message(chat_id, "Running Codex...")
-        reply, usage = self.run_codex(text, chat_id=chat_id, status_message_id=status_message_id)
+        reply, usage = self.run_codex(
+            text,
+            chat_id=chat_id,
+            status_message_id=status_message_id,
+            image_message=message if has_image else None,
+        )
         self.record_usage(usage)
         self.save_last_activity()
         self.send_message(chat_id, reply)
 
-    def build_command(self, prompt: str) -> list[str]:
+    def build_command(self, prompt: str, image_paths: list[str] | None = None) -> list[str]:
         thread_id = self.load_thread_id()
         base = ["codex", "-C", self.workdir, "exec"]
         if thread_id:
             base.extend(["resume", thread_id])
         base.extend(self.codex_flags)
+        for image_path in image_paths or []:
+            base.extend(["--image", image_path])
         base.extend(["--skip-git-repo-check", "--output-last-message"])
         return base + [prompt]
 
@@ -1017,14 +1057,27 @@ class TelegramCodexBridge:
         state["last_text"] = text
         state["last_edit_at"] = now
 
-    def run_codex(self, prompt: str, *, chat_id: str, status_message_id: int | None) -> tuple[str, dict]:
+    def run_codex(
+        self,
+        prompt: str,
+        *,
+        chat_id: str,
+        status_message_id: int | None,
+        image_message: dict | None = None,
+    ) -> tuple[str, dict]:
         with tempfile.NamedTemporaryFile(prefix="codex-last-message-", delete=False) as tmp:
             output_path = tmp.name
+        temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
+        image_paths: list[str] = []
         thread_before = self.load_thread_id()
         full_prompt = prompt
         if not thread_before and self.system_prompt:
             full_prompt = f"{self.system_prompt}\n\nUser message from Telegram:\n{prompt}"
-        cmd = self.build_command(full_prompt)
+        if image_message is not None:
+            temp_dir_obj = tempfile.TemporaryDirectory(prefix="telegram-image-")
+            image_path = self.download_image_from_message(image_message, Path(temp_dir_obj.name))
+            image_paths.append(str(image_path))
+        cmd = self.build_command(full_prompt, image_paths=image_paths)
         insert_at = len(cmd) - 1
         cmd[insert_at:insert_at] = [output_path]
         self.log_event("CODEX", "Executing Codex request")
@@ -1136,6 +1189,8 @@ class TelegramCodexBridge:
             message = Path(output_path).read_text().strip()
         finally:
             Path(output_path).unlink(missing_ok=True)
+            if temp_dir_obj is not None:
+                temp_dir_obj.cleanup()
         if timeout_reason:
             usage = self.finalize_usage(full_prompt, timeout_reason, "timeout", exact_usage)
             self.maybe_update_progress(

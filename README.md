@@ -9,7 +9,7 @@ This project runs a small Python bridge that:
 - relays Codex progress back to Telegram while work is running
 - sends Codex's final reply back to Telegram
 - keeps one saved Codex thread so follow-up messages continue the same conversation
-- supports text plus Telegram voice/audio messages
+- supports text, Telegram photos/image documents, and Telegram voice/audio messages
 
 This is designed for a single authorized Telegram user talking to one local Codex environment.
 
@@ -191,6 +191,12 @@ Recommended values:
 Required for voice support:
 
 - `OPENAI_API_KEY`
+
+Image support:
+
+- send a Telegram photo or an image document
+- if you include a caption, the caption is used as the prompt text
+- if you send only the image, the bridge asks Codex to inspect the attached image
 
 Optional for `/meter` API cost estimates:
 
