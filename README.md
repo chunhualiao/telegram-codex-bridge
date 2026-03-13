@@ -10,6 +10,9 @@ This project runs a small Python bridge that:
 - sends Codex's final reply back to Telegram
 - keeps one saved Codex thread so follow-up messages continue the same conversation
 - supports text, Telegram photos/image documents, and Telegram voice/audio messages
+- stores a local usage meter with token counts and estimated API cost
+- enforces both a repo-local process lock and a machine-wide Telegram-token lock
+- requires a passphrase again after inactivity and queues the interrupted message until unlock
 
 This is designed for a single authorized Telegram user talking to one local Codex environment.
 
@@ -71,6 +74,9 @@ curl -sS "https://api.telegram.org"
 - `run-bridge.sh`
   Small wrapper script for launching the bridge from the correct directory.
 
+- `restart-bridge.sh`
+  macOS LaunchAgent-aware restart helper that clears stale local and token locks before kickstarting the service.
+
 - `watch-log.sh`
   Tails the local conversation log so you can watch Telegram-driven activity on the computer.
 
@@ -82,6 +88,45 @@ curl -sS "https://api.telegram.org"
 
 - `SETUP_AND_USAGE.md`
   Detailed operational notes and troubleshooting guide.
+
+## System Architecture
+
+```mermaid
+flowchart TD
+    U[Authorized Telegram user] -->|private chat message| TG[Telegram Bot API]
+    TG --> B[bridge.py]
+
+    B -->|poll offset + runtime state| S[state/]
+    B -->|repo lock| L1[state/bridge.lock]
+    B -->|machine-wide token lock| L2[~/.telegram-bridge-locks/token-fingerprint.lock]
+
+    B -->|text prompt| C[local codex exec]
+    B -->|photo or image document| IMG[download image to temp file]
+    IMG --> C
+
+    B -->|voice/audio file| AUD[download media]
+    AUD --> FFMPEG[ffmpeg -> WAV]
+    FFMPEG --> OPENAI[OpenAI transcription API]
+    OPENAI -->|transcript| C
+
+    C -->|JSON event stream| B
+    B -->|progress edits + final reply| TG
+
+    B -->|pricing lookup| PR1[OpenAI pricing page]
+    B -->|pricing fallback| PR2[OpenRouter models API]
+    PR1 --> B
+    PR2 --> B
+```
+
+Runtime flow in practice:
+
+1. Telegram delivers a private message from the single allowed user.
+2. `bridge.py` checks the allowed chat/user IDs and the inactivity passphrase gate.
+3. If the message is voice, it is converted with `ffmpeg` and transcribed through the OpenAI transcription API.
+4. If the message includes an image, the image is downloaded and attached to `codex exec --image`.
+5. The bridge launches local `codex exec`, optionally resuming the saved thread ID.
+6. While Codex emits JSON events, the bridge edits the Telegram status message with progress updates.
+7. The final reply is sent back to Telegram, and the bridge records request/token/cost data under `state/usage_meter.json`.
 
 ## Step-By-Step Setup
 
@@ -169,6 +214,9 @@ OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
 OPENAI_TRANSCRIBE_PROMPT=The speaker may use Mandarin Chinese, English, or both in the same message. Transcribe both languages accurately. Preserve code, file paths, commands, technical terms, names, and numbers. Keep the transcript faithful to what was said.
 METER_PRICE_LOOKUP=auto
 METER_PRICE_CACHE_TTL_SECONDS=86400
+TELEGRAM_PROGRESS_INTERVAL=15
+TELEGRAM_PROGRESS_EDIT_INTERVAL=2
+TELEGRAM_CONFLICT_EXIT_THRESHOLD=3
 ```
 
 Minimum required values:
@@ -208,6 +256,15 @@ Optional for `/meter` API cost estimates:
 
 - `METER_PRICE_CACHE_TTL_SECONDS=86400`
   Cache pricing lookups locally under `state/pricing_cache.json`.
+
+- `TELEGRAM_PROGRESS_INTERVAL=15`
+  Idle heartbeat interval for status-message updates while Codex is still working.
+
+- `TELEGRAM_PROGRESS_EDIT_INTERVAL=2`
+  Minimum seconds between Telegram status-message edits.
+
+- `TELEGRAM_CONFLICT_EXIT_THRESHOLD=3`
+  How many repeated Telegram `409 Conflict` polling errors to tolerate before exiting.
 
 - `METER_PRICE_INPUT_PER_1M_TOKENS`
 - `METER_PRICE_OUTPUT_PER_1M_TOKENS`
@@ -342,8 +399,11 @@ Normal usage:
 
 - Send any plain text request as if you were talking directly to Codex.
 - Or send a Telegram voice message.
+- Or send a Telegram photo / image document.
 - Follow-up messages continue the same Codex thread.
 - Use `/reset` before switching to a completely different task.
+- If you send an image with no caption, the bridge asks Codex to inspect the attached image.
+- If you send an image with a caption, the caption becomes the prompt.
 
 While Codex is running, the bot now tries to relay progress in real time by editing the `Running Codex...` status message with milestones and heartbeat updates.
 
@@ -418,6 +478,23 @@ If you use it:
 3. Register it from your own logged-in shell
 
 Foreground execution should always be your first validation step. Do not debug LaunchAgent behavior before the bridge itself works normally.
+
+### Option 3: Restart the installed LaunchAgent cleanly
+
+If you already installed the LaunchAgent and want a predictable restart:
+
+```bash
+./restart-bridge.sh
+```
+
+This script:
+
+- finds the LaunchAgent plist that points at this repo
+- unloads duplicates
+- kills leftover `bridge.py` processes for this repo
+- removes stale `state/bridge.lock`
+- removes the matching machine-wide Telegram token lock
+- bootstraps and kickstarts the canonical LaunchAgent again
 
 ## How To Stop The Bridge
 
@@ -497,6 +574,16 @@ Check these first:
 
 The bridge converts Telegram voice/audio to WAV with `ffmpeg`, then sends that audio to the OpenAI transcription API.
 
+### `/meter` looks wrong or incomplete
+
+This bridge meter is local accounting, not provider billing truth.
+
+- If Codex emits usage fields in its JSON events, the bridge uses those exact token counts.
+- If Codex does not emit usage fields, the bridge estimates tokens from prompt/reply length.
+- Cost is estimated from cached pricing lookups or manual fallback values in `.env`.
+
+So `/meter` is useful for operational visibility, but should not be treated as the final billing source of record.
+
 ### `getUpdates` returns nothing
 
 Usually this means:
@@ -524,19 +611,3 @@ Start in the foreground first and fix that before backgrounding it.
 - Anyone who controls the allowed Telegram account can use the bridge.
 - `.env` contains secrets and should never be committed.
 - `state/` is runtime data and should not be committed.
-
-## Recommended First-Time Install Checklist
-
-Use this order on a new machine:
-
-1. Clone the repo.
-2. Create the bot with BotFather.
-3. Send the bot one message.
-4. Get `chat.id` from `getUpdates`.
-5. Fill in `.env`.
-6. Run `python3 bridge.py`.
-7. Confirm the bot sends `Telegram Codex bridge is online.`
-8. Send `/status`.
-9. Send one normal prompt.
-10. Only then move to background execution.
-# telegram-codex-bridge
