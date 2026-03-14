@@ -201,12 +201,14 @@ TELEGRAM_BOT_TOKEN=123456789:replace_me
 TELEGRAM_ALLOWED_CHAT_ID=123456789
 TELEGRAM_ALLOWED_USER_ID=123456789
 TELEGRAM_PASSPHRASE=replace_me
+TELEGRAM_AUTH_REQUIRED=true
 
 CODEX_WORKDIR=/path/to/your/workdir
 CODEX_FLAGS=--full-auto --json
 CODEX_SYSTEM_PROMPT=You are talking to me through Telegram. Keep responses concise unless I ask for depth.
 CODEX_MAX_RUNTIME_SECONDS=900
 CODEX_IDLE_TIMEOUT_SECONDS=120
+CODEX_COMMAND_IDLE_TIMEOUT_SECONDS=600
 TELEGRAM_POLL_TIMEOUT=30
 TELEGRAM_INACTIVITY_TIMEOUT_SECONDS=3600
 OPENAI_API_KEY=sk-replace_me
@@ -230,6 +232,8 @@ Passphrase behavior:
 
 - after `TELEGRAM_INACTIVITY_TIMEOUT_SECONDS` with no accepted activity, the bridge locks itself
 - the next Telegram message must be the configured passphrase before normal commands resume
+- `TELEGRAM_AUTH_REQUIRED=false` disables that inactivity lock entirely
+- `/config set bridge.passphrase ...` changes the passphrase only for the current bridge process and is not persisted to disk
 
 Recommended values:
 
@@ -391,6 +395,9 @@ Supported Telegram commands:
 
 - `/meter`
   Shows cumulative bridge token counts, how much was exact vs estimated, and estimated API cost when pricing is configured.
+
+- `/config`
+  Opens the runtime config menu. Use `/config list`, `/config show <key>`, `/config set <key> <value>`, `/config unset <key>`, `/config menu <section>`, or `/config reset`.
 
 - `/reset`
   Deletes the saved Codex thread so the next message starts a fresh Codex session.

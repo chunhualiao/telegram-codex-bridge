@@ -65,6 +65,15 @@ def parse_float_env(name: str, default: float = 0.0) -> float:
         raise SystemExit(f"Invalid float value for {name}: {raw}")
 
 
+def parse_bool_text(raw: str) -> bool:
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {raw}")
+
+
 class TelegramCodexBridge:
     def __init__(self) -> None:
         load_env_file(ENV_PATH)
@@ -73,6 +82,7 @@ class TelegramCodexBridge:
         self.allowed_chat_id = require_env("TELEGRAM_ALLOWED_CHAT_ID")
         self.allowed_user_id = require_env("TELEGRAM_ALLOWED_USER_ID")
         self.passphrase = require_env("TELEGRAM_PASSPHRASE")
+        self.auth_required = parse_bool_text(os.environ.get("TELEGRAM_AUTH_REQUIRED", "true"))
         self.workdir = os.environ.get("CODEX_WORKDIR", str(Path.home()))
         self.codex_flags = shlex.split(os.environ.get("CODEX_FLAGS", "--full-auto"))
         if "--json" not in self.codex_flags:
@@ -97,20 +107,28 @@ class TelegramCodexBridge:
         self.transcript_file = STATE_DIR / "conversation.log"
         self.usage_meter_file = STATE_DIR / "usage_meter.json"
         self.pricing_cache_file = STATE_DIR / "pricing_cache.json"
+        self.runtime_config_file = STATE_DIR / "runtime_config.json"
         self.progress_interval = int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "15"))
         self.progress_edit_interval = float(os.environ.get("TELEGRAM_PROGRESS_EDIT_INTERVAL", "2"))
         self.inactivity_timeout = int(os.environ.get("TELEGRAM_INACTIVITY_TIMEOUT_SECONDS", "3600"))
         self.codex_max_runtime = int(os.environ.get("CODEX_MAX_RUNTIME_SECONDS", "900"))
         self.codex_idle_timeout = int(os.environ.get("CODEX_IDLE_TIMEOUT_SECONDS", "120"))
+        self.codex_command_idle_timeout = int(
+            os.environ.get("CODEX_COMMAND_IDLE_TIMEOUT_SECONDS", "600")
+        )
         self.meter_price_model = os.environ.get("METER_PRICE_MODEL", "").strip()
         self.meter_price_input_per_million = parse_float_env("METER_PRICE_INPUT_PER_1M_TOKENS", 0.0)
         self.meter_price_output_per_million = parse_float_env("METER_PRICE_OUTPUT_PER_1M_TOKENS", 0.0)
         self.pricing_lookup_preference = os.environ.get("METER_PRICE_LOOKUP", "auto").strip().lower() or "auto"
         self.pricing_cache_ttl_seconds = int(os.environ.get("METER_PRICE_CACHE_TTL_SECONDS", "86400"))
-        self.detected_model_name = self.detect_model_name()
+        self.codex_model_override = ""
         self.conflict_exit_threshold = int(
             os.environ.get("TELEGRAM_CONFLICT_EXIT_THRESHOLD", str(DEFAULT_CONFLICT_EXIT_THRESHOLD))
         )
+        self.config_defaults = self.capture_runtime_config_defaults()
+        self.runtime_config_overrides = self.load_runtime_config()
+        self.apply_runtime_config(self.runtime_config_overrides)
+        self.detected_model_name = self.detect_model_name()
         token_fingerprint = hashlib.sha256(self.bot_token.encode("utf-8")).hexdigest()[:16]
         self.global_lock_dir = Path.home() / ".telegram-bridge-locks"
         self.global_lock_file = self.global_lock_dir / f"{token_fingerprint}.lock"
@@ -143,11 +161,17 @@ class TelegramCodexBridge:
             return f"{event_type} ({item_type})"
         return event_type
 
+    def current_idle_timeout_seconds(self, active_item_type: str | None) -> int:
+        if active_item_type == "command_execution":
+            return max(self.codex_idle_timeout, self.codex_command_idle_timeout)
+        return self.codex_idle_timeout
+
     def build_timeout_diagnostics(
         self,
         *,
         elapsed: int,
         quiet_for: int,
+        idle_timeout: int | None = None,
         last_event_at: float | None,
         last_event_summary: str | None,
         recent_output_tail: list[str],
@@ -156,6 +180,8 @@ class TelegramCodexBridge:
             f"Elapsed: {elapsed}s",
             f"Silent for: {quiet_for}s",
         ]
+        if idle_timeout is not None:
+            lines.append(f"Idle timeout: {idle_timeout}s")
         if last_event_at is not None:
             lines.append(
                 "Last Codex event: "
@@ -166,6 +192,579 @@ class TelegramCodexBridge:
             lines.append("Last Codex event: none captured")
         lines.append(f"Recent output tail: {self.format_recent_output_tail(recent_output_tail)}")
         return "\n".join(lines)
+
+    def capture_runtime_config_defaults(self) -> dict:
+        return {
+            "codex.workdir": self.workdir,
+            "codex.flags": list(self.codex_flags),
+            "codex.model": self.codex_model_override,
+            "codex.system_prompt": self.system_prompt,
+            "codex.max_runtime_seconds": self.codex_max_runtime,
+            "codex.idle_timeout_seconds": self.codex_idle_timeout,
+            "codex.command_idle_timeout_seconds": self.codex_command_idle_timeout,
+            "bridge.poll_timeout_seconds": self.poll_timeout,
+            "bridge.progress_interval_seconds": self.progress_interval,
+            "bridge.progress_edit_interval_seconds": self.progress_edit_interval,
+            "bridge.inactivity_timeout_seconds": self.inactivity_timeout,
+            "bridge.conflict_exit_threshold": self.conflict_exit_threshold,
+            "bridge.auth_required": self.auth_required,
+            "bridge.passphrase": self.passphrase,
+            "voice.transcribe_model": self.transcribe_model,
+            "voice.transcribe_prompt": self.transcribe_prompt,
+            "meter.price_model": self.meter_price_model,
+            "meter.price_input_per_1m_tokens": self.meter_price_input_per_million,
+            "meter.price_output_per_1m_tokens": self.meter_price_output_per_million,
+            "meter.price_lookup": self.pricing_lookup_preference,
+            "meter.price_cache_ttl_seconds": self.pricing_cache_ttl_seconds,
+        }
+
+    def runtime_config_specs(self) -> dict:
+        return {
+            "bridge.conflict_exit_threshold": {
+                "attr": "conflict_exit_threshold",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=1),
+                "formatter": str,
+                "help": "How many Telegram 409 polling conflicts before exiting.",
+            },
+            "bridge.auth_required": {
+                "attr": "auth_required",
+                "parser": lambda raw: parse_bool_text(raw),
+                "formatter": self.format_config_bool,
+                "help": "Whether the inactivity unlock gate is enabled.",
+            },
+            "bridge.inactivity_timeout_seconds": {
+                "attr": "inactivity_timeout",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=60),
+                "formatter": str,
+                "help": "How long the session can sit idle before re-locking.",
+            },
+            "bridge.passphrase": {
+                "attr": "passphrase",
+                "parser": self.parse_config_string,
+                "formatter": self.format_secret_config_value,
+                "help": "Runtime unlock passphrase. Shown masked in config output and kept in memory only.",
+            },
+            "bridge.poll_timeout_seconds": {
+                "attr": "poll_timeout",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=1),
+                "formatter": str,
+                "help": "Telegram long-poll timeout in seconds.",
+            },
+            "bridge.progress_edit_interval_seconds": {
+                "attr": "progress_edit_interval",
+                "parser": lambda raw: self.parse_config_float(raw, minimum=0.1),
+                "formatter": self.format_config_float,
+                "help": "Minimum spacing between progress message edits.",
+            },
+            "bridge.progress_interval_seconds": {
+                "attr": "progress_interval",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=1),
+                "formatter": str,
+                "help": "How often the bridge sends heartbeat progress updates.",
+            },
+            "codex.flags": {
+                "attr": "codex_flags",
+                "parser": self.parse_config_flags,
+                "formatter": self.format_config_flags,
+                "help": "Additional CLI flags passed to `codex exec`.",
+            },
+            "codex.idle_timeout_seconds": {
+                "attr": "codex_idle_timeout",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=10),
+                "formatter": str,
+                "help": "How long Codex may stay silent before the bridge stops it.",
+            },
+            "codex.command_idle_timeout_seconds": {
+                "attr": "codex_command_idle_timeout",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=10),
+                "formatter": str,
+                "help": "How long an active Codex command execution may stay silent before the bridge stops it.",
+            },
+            "codex.max_runtime_seconds": {
+                "attr": "codex_max_runtime",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=30),
+                "formatter": str,
+                "help": "Hard maximum runtime for a Codex request.",
+            },
+            "codex.model": {
+                "attr": "codex_model_override",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "Model override injected into Codex CLI requests.",
+            },
+            "codex.system_prompt": {
+                "attr": "system_prompt",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "Prepended system prompt used for new sessions.",
+            },
+            "codex.workdir": {
+                "attr": "workdir",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "Working directory passed to `codex -C`.",
+            },
+            "meter.price_cache_ttl_seconds": {
+                "attr": "pricing_cache_ttl_seconds",
+                "parser": lambda raw: self.parse_config_int(raw, minimum=0),
+                "formatter": str,
+                "help": "How long cached pricing lookups remain valid.",
+            },
+            "meter.price_input_per_1m_tokens": {
+                "attr": "meter_price_input_per_million",
+                "parser": lambda raw: self.parse_config_float(raw, minimum=0.0),
+                "formatter": self.format_config_float,
+                "help": "Manual input price fallback in USD per million tokens.",
+            },
+            "meter.price_lookup": {
+                "attr": "pricing_lookup_preference",
+                "parser": self.parse_config_price_lookup,
+                "formatter": self.format_config_string,
+                "help": "Pricing lookup mode: auto, openai, openrouter, or manual.",
+            },
+            "meter.price_model": {
+                "attr": "meter_price_model",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "Model name used for pricing lookups.",
+            },
+            "meter.price_output_per_1m_tokens": {
+                "attr": "meter_price_output_per_million",
+                "parser": lambda raw: self.parse_config_float(raw, minimum=0.0),
+                "formatter": self.format_config_float,
+                "help": "Manual output price fallback in USD per million tokens.",
+            },
+            "voice.transcribe_model": {
+                "attr": "transcribe_model",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "OpenAI transcription model name.",
+            },
+            "voice.transcribe_prompt": {
+                "attr": "transcribe_prompt",
+                "parser": self.parse_config_string,
+                "formatter": self.format_config_string,
+                "help": "Prompt sent with voice transcription requests.",
+            },
+        }
+
+    def runtime_config_aliases(self) -> dict:
+        return {
+            "conflict_threshold": "bridge.conflict_exit_threshold",
+            "auth": "bridge.auth_required",
+            "auth_required": "bridge.auth_required",
+            "command_idle_timeout": "codex.command_idle_timeout_seconds",
+            "idle_timeout": "codex.idle_timeout_seconds",
+            "inactivity_timeout": "bridge.inactivity_timeout_seconds",
+            "max_runtime": "codex.max_runtime_seconds",
+            "model": "codex.model",
+            "passphrase": "bridge.passphrase",
+            "poll_timeout": "bridge.poll_timeout_seconds",
+            "price_input": "meter.price_input_per_1m_tokens",
+            "price_lookup": "meter.price_lookup",
+            "price_model": "meter.price_model",
+            "price_output": "meter.price_output_per_1m_tokens",
+            "progress_edit_interval": "bridge.progress_edit_interval_seconds",
+            "progress_interval": "bridge.progress_interval_seconds",
+            "system_prompt": "codex.system_prompt",
+            "transcribe_model": "voice.transcribe_model",
+            "transcribe_prompt": "voice.transcribe_prompt",
+            "workdir": "codex.workdir",
+        }
+
+    def parse_config_int(self, raw: str, *, minimum: int | None = None) -> int:
+        value = int(raw.strip())
+        if minimum is not None and value < minimum:
+            raise ValueError(f"Value must be >= {minimum}")
+        return value
+
+    def parse_config_float(self, raw: str, *, minimum: float | None = None) -> float:
+        value = float(raw.strip())
+        if minimum is not None and value < minimum:
+            raise ValueError(f"Value must be >= {minimum}")
+        return value
+
+    def parse_config_string(self, raw: str) -> str:
+        value = raw.strip()
+        if not value:
+            raise ValueError("Value may not be empty.")
+        return value
+
+    def parse_config_flags(self, raw: str) -> list[str]:
+        flags = shlex.split(raw)
+        if not flags:
+            raise ValueError("At least one flag is required.")
+        if "--json" not in flags:
+            flags.append("--json")
+        return flags
+
+    def parse_config_price_lookup(self, raw: str) -> str:
+        value = raw.strip().lower()
+        if value not in {"auto", "manual", "openai", "openrouter"}:
+            raise ValueError("Allowed values: auto, manual, openai, openrouter")
+        return value
+
+    def parse_runtime_config_raw_value(self, key: str, raw_value: object) -> object:
+        if key == "codex.flags":
+            if not isinstance(raw_value, list):
+                raise ValueError("Expected a list of flags.")
+            if not all(isinstance(item, str) for item in raw_value):
+                raise ValueError("Flag list must contain only strings.")
+            return self.parse_config_flags(shlex.join(raw_value))
+        if key in {"bridge.auth_required"}:
+            if isinstance(raw_value, bool):
+                return raw_value
+            if isinstance(raw_value, str):
+                return parse_bool_text(raw_value)
+            raise ValueError("Expected a boolean value.")
+        if key in {
+            "bridge.conflict_exit_threshold",
+            "bridge.inactivity_timeout_seconds",
+            "bridge.poll_timeout_seconds",
+            "bridge.progress_interval_seconds",
+            "codex.idle_timeout_seconds",
+            "codex.command_idle_timeout_seconds",
+            "codex.max_runtime_seconds",
+            "meter.price_cache_ttl_seconds",
+        }:
+            if isinstance(raw_value, bool) or not isinstance(raw_value, int):
+                raise ValueError("Expected an integer value.")
+            return self.runtime_config_specs()[key]["parser"](str(raw_value))
+        if key in {
+            "bridge.progress_edit_interval_seconds",
+            "meter.price_input_per_1m_tokens",
+            "meter.price_output_per_1m_tokens",
+        }:
+            if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                raise ValueError("Expected a numeric value.")
+            return self.runtime_config_specs()[key]["parser"](str(raw_value))
+        if not isinstance(raw_value, str):
+            raise ValueError("Expected a string value.")
+        return self.runtime_config_specs()[key]["parser"](raw_value)
+
+    def format_config_string(self, value: object) -> str:
+        text = str(value)
+        if len(text) > 120:
+            return text[:117] + "..."
+        return text
+
+    def format_config_flags(self, value: object) -> str:
+        flags = list(value) if isinstance(value, list) else [str(value)]
+        return shlex.join(flags)
+
+    def format_config_float(self, value: object) -> str:
+        return f"{float(value):g}"
+
+    def format_config_bool(self, value: object) -> str:
+        return "true" if bool(value) else "false"
+
+    def format_secret_config_value(self, value: object) -> str:
+        text = str(value or "")
+        if not text:
+            return "(empty)"
+        if len(text) <= 4:
+            return "*" * len(text)
+        return f"{text[:2]}{'*' * (len(text) - 4)}{text[-2:]}"
+
+    def normalize_config_key(self, raw_key: str) -> str:
+        key = raw_key.strip().lower()
+        key = self.runtime_config_aliases().get(key, key)
+        return key
+
+    def default_runtime_config(self) -> dict:
+        return {}
+
+    def runtime_config_persistent_keys(self) -> set[str]:
+        return {
+            key
+            for key in self.runtime_config_specs()
+            if key not in {"bridge.passphrase"}
+        }
+
+    def load_runtime_config(self) -> dict:
+        if not self.runtime_config_file.exists():
+            return self.default_runtime_config()
+        try:
+            payload = json.loads(self.runtime_config_file.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return self.default_runtime_config()
+        if not isinstance(payload, dict):
+            return self.default_runtime_config()
+        specs = self.runtime_config_specs()
+        sanitized: dict[str, object] = {}
+        for raw_key, raw_value in payload.items():
+            key = self.normalize_config_key(str(raw_key))
+            if key not in self.runtime_config_persistent_keys():
+                continue
+            spec = specs.get(key)
+            if spec is None:
+                continue
+            try:
+                sanitized[key] = self.parse_runtime_config_raw_value(key, raw_value)
+            except (TypeError, ValueError):
+                continue
+        return sanitized
+
+    def save_runtime_config(self) -> None:
+        persisted: dict[str, object] = {}
+        specs = self.runtime_config_specs()
+        for key, value in sorted(self.runtime_config_overrides.items()):
+            if key not in self.runtime_config_persistent_keys():
+                continue
+            spec = specs.get(key)
+            if spec is None:
+                continue
+            persisted[key] = value
+        self.runtime_config_file.write_text(json.dumps(persisted, indent=2, sort_keys=True), encoding="utf-8")
+
+    def apply_runtime_config(self, overrides: dict) -> None:
+        specs = self.runtime_config_specs()
+        for key, spec in specs.items():
+            default_value = self.config_defaults[key]
+            value = overrides.get(key, default_value)
+            if isinstance(default_value, list):
+                value = list(value)
+            setattr(self, spec["attr"], value)
+        if "--json" not in self.codex_flags:
+            self.codex_flags.append("--json")
+        self.detected_model_name = self.detect_model_name()
+
+    def set_runtime_config_value(self, raw_key: str, raw_value: str) -> tuple[str, object]:
+        key = self.normalize_config_key(raw_key)
+        spec = self.runtime_config_specs().get(key)
+        if spec is None:
+            raise KeyError(key)
+        value = spec["parser"](raw_value)
+        if self.config_defaults.get(key) == value:
+            self.runtime_config_overrides.pop(key, None)
+        else:
+            self.runtime_config_overrides[key] = value
+        self.save_runtime_config()
+        self.apply_runtime_config(self.runtime_config_overrides)
+        return key, value
+
+    def unset_runtime_config_value(self, raw_key: str) -> str:
+        key = self.normalize_config_key(raw_key)
+        if key not in self.runtime_config_specs():
+            raise KeyError(key)
+        self.runtime_config_overrides.pop(key, None)
+        self.save_runtime_config()
+        self.apply_runtime_config(self.runtime_config_overrides)
+        return key
+
+    def clear_runtime_config(self) -> None:
+        self.runtime_config_overrides = {}
+        self.save_runtime_config()
+        self.apply_runtime_config(self.runtime_config_overrides)
+
+    def format_config_value(self, key: str, value: object) -> str:
+        spec = self.runtime_config_specs()[key]
+        return spec["formatter"](value)
+
+    def format_config_overview(self) -> str:
+        lines = [
+            "Bridge config",
+            "Commands: `/config list`, `/config show <key>`, `/config set <key> <value>`, `/config unset <key>`, `/config reset`",
+            "",
+        ]
+        for key in sorted(self.runtime_config_specs()):
+            value = getattr(self, self.runtime_config_specs()[key]["attr"])
+            source = "override" if key in self.runtime_config_overrides else "default"
+            lines.append(f"{key} = {self.format_config_value(key, value)} [{source}]")
+        return "\n".join(lines)
+
+    def format_config_key_details(self, raw_key: str) -> str:
+        key = self.normalize_config_key(raw_key)
+        spec = self.runtime_config_specs().get(key)
+        if spec is None:
+            raise KeyError(key)
+        current_value = getattr(self, spec["attr"])
+        default_value = self.config_defaults[key]
+        override_value = self.runtime_config_overrides.get(key)
+        lines = [
+            f"Config key: {key}",
+            f"Current: {self.format_config_value(key, current_value)}",
+            f"Default: {self.format_config_value(key, default_value)}",
+            f"Override: {self.format_config_value(key, override_value) if override_value is not None else 'none'}",
+            f"Description: {spec['help']}",
+        ]
+        return "\n".join(lines)
+
+    def build_reply_keyboard(self, rows: list[list[str]], *, one_time: bool = False) -> dict:
+        keyboard = []
+        for row in rows:
+            buttons = []
+            for label in row:
+                buttons.append({"text": label})
+            keyboard.append(buttons)
+        return {
+            "keyboard": keyboard,
+            "resize_keyboard": True,
+            "one_time_keyboard": one_time,
+        }
+
+    def build_remove_keyboard(self) -> dict:
+        return {"remove_keyboard": True}
+
+    def config_menu_markup(self, section: str = "root") -> dict:
+        normalized = section.strip().lower() or "root"
+        if normalized == "codex":
+            return self.build_reply_keyboard(
+                [
+                    ["/config show codex.model", "/config show codex.workdir"],
+                    ["/config show codex.flags", "/config show codex.system_prompt"],
+                    ["/config show codex.idle_timeout_seconds", "/config show codex.max_runtime_seconds"],
+                    ["/config menu presets", "/config"],
+                ]
+            )
+        if normalized == "bridge":
+            return self.build_reply_keyboard(
+                [
+                    ["/config show bridge.auth_required", "/config set bridge.auth_required true"],
+                    ["/config set bridge.auth_required false", "/config show bridge.passphrase"],
+                    ["/config show bridge.poll_timeout_seconds", "/config show bridge.inactivity_timeout_seconds"],
+                    ["/config show bridge.progress_interval_seconds", "/config show bridge.progress_edit_interval_seconds"],
+                    ["/config show bridge.conflict_exit_threshold", "/config menu presets"],
+                    ["/config", "/config hide"],
+                ]
+            )
+        if normalized == "meter":
+            return self.build_reply_keyboard(
+                [
+                    ["/config show meter.price_model", "/config show meter.price_lookup"],
+                    ["/config show meter.price_input_per_1m_tokens", "/config show meter.price_output_per_1m_tokens"],
+                    ["/config set meter.price_lookup auto", "/config set meter.price_lookup manual"],
+                    ["/config", "/config hide"],
+                ]
+            )
+        if normalized == "voice":
+            return self.build_reply_keyboard(
+                [
+                    ["/config show voice.transcribe_model", "/config show voice.transcribe_prompt"],
+                    ["/config", "/config hide"],
+                ]
+            )
+        if normalized == "presets":
+            return self.build_reply_keyboard(
+                [
+                    ["/config set codex.idle_timeout_seconds 300", "/config set codex.max_runtime_seconds 1800"],
+                    ["/config set bridge.progress_interval_seconds 30", "/config set bridge.progress_edit_interval_seconds 5"],
+                    ["/config set meter.price_lookup auto", "/config set meter.price_lookup manual"],
+                    ["/config", "/config hide"],
+                ]
+            )
+        return self.build_reply_keyboard(
+            [
+                ["/config list", "/config reset"],
+                ["/config menu codex", "/config menu bridge"],
+                ["/config menu meter", "/config menu voice"],
+                ["/config menu presets", "/config hide"],
+            ]
+        )
+
+    def handle_config_command(self, chat_id: str, text: str) -> None:
+        parts = text.split(None, 3)
+        self.save_last_activity()
+        if len(parts) == 1:
+            self.send_message(
+                chat_id,
+                "Bridge config menu\nTap a section, inspect a key, then use `/config set <key> <value>` when you want to change it.",
+                reply_markup=self.config_menu_markup(),
+            )
+            return
+        subcommand = parts[1].lower()
+        if subcommand == "hide":
+            self.send_message(chat_id, "Config menu hidden.", reply_markup=self.build_remove_keyboard())
+            return
+        if subcommand == "menu":
+            section = parts[2] if len(parts) >= 3 else "root"
+            self.send_message(
+                chat_id,
+                f"Config menu: {section}",
+                reply_markup=self.config_menu_markup(section),
+            )
+            return
+        if subcommand == "list":
+            self.send_message(chat_id, self.format_config_overview(), reply_markup=self.config_menu_markup())
+            return
+        if subcommand == "show":
+            if len(parts) < 3:
+                self.send_message(chat_id, "Usage: `/config show <key>`", reply_markup=self.config_menu_markup())
+                return
+            try:
+                payload = self.format_config_key_details(parts[2])
+            except KeyError:
+                self.send_message(chat_id, f"Unknown config key: {parts[2]}", reply_markup=self.config_menu_markup())
+                return
+            self.send_message(chat_id, payload, reply_markup=self.config_menu_markup())
+            return
+        if subcommand == "set":
+            if len(parts) < 4:
+                self.send_message(chat_id, "Usage: `/config set <key> <value>`", reply_markup=self.config_menu_markup())
+                return
+            try:
+                key, value = self.set_runtime_config_value(parts[2], parts[3])
+            except KeyError:
+                self.send_message(chat_id, f"Unknown config key: {parts[2]}", reply_markup=self.config_menu_markup())
+                return
+            except ValueError as exc:
+                self.send_message(
+                    chat_id,
+                    f"Invalid config value for {parts[2]}: {exc}",
+                    reply_markup=self.config_menu_markup(),
+                )
+                return
+            self.send_message(
+                chat_id,
+                f"Updated {key} = {self.format_config_value(key, value)}",
+                reply_markup=self.config_menu_markup(),
+            )
+            return
+        if subcommand == "unset":
+            if len(parts) < 3:
+                self.send_message(chat_id, "Usage: `/config unset <key>`", reply_markup=self.config_menu_markup())
+                return
+            try:
+                key = self.unset_runtime_config_value(parts[2])
+            except KeyError:
+                self.send_message(chat_id, f"Unknown config key: {parts[2]}", reply_markup=self.config_menu_markup())
+                return
+            self.send_message(chat_id, f"Removed override for {key}", reply_markup=self.config_menu_markup())
+            return
+        if subcommand == "reset":
+            self.clear_runtime_config()
+            self.send_message(chat_id, "Cleared all runtime config overrides.", reply_markup=self.config_menu_markup())
+            return
+        self.send_message(
+            chat_id,
+            "Unknown `/config` subcommand. Use `/config`, `/config list`, `/config show <key>`, "
+            "`/config set <key> <value>`, `/config unset <key>`, `/config menu <section>`, or `/config reset`.",
+            reply_markup=self.config_menu_markup(),
+        )
+
+    def effective_codex_flags(self) -> list[str]:
+        flags = list(self.codex_flags)
+        if not self.codex_model_override:
+            return flags
+        filtered: list[str] = []
+        skip_next = False
+        for flag in flags:
+            if skip_next:
+                skip_next = False
+                continue
+            if flag in {"--model", "-m"}:
+                skip_next = True
+                continue
+            if flag.startswith("--model="):
+                continue
+            filtered.append(flag)
+        return filtered
+
+    def redact_user_message_for_log(self, text: str) -> str:
+        stripped = text.strip()
+        if stripped.startswith("/config set bridge.passphrase "):
+            return "/config set bridge.passphrase [redacted]"
+        return text
 
     def run(self) -> None:
         self.acquire_lock()
@@ -304,6 +903,8 @@ class TelegramCodexBridge:
         return value or None
 
     def detect_model_name(self) -> str:
+        if self.codex_model_override:
+            return self.codex_model_override
         for index, flag in enumerate(self.codex_flags):
             if flag == "--model" and index + 1 < len(self.codex_flags):
                 return self.codex_flags[index + 1]
@@ -380,6 +981,8 @@ class TelegramCodexBridge:
         self.clear_lock_notice()
 
     def is_unlock_required(self) -> bool:
+        if not self.auth_required:
+            return False
         last_activity = self.load_last_activity()
         if last_activity is None:
             return True
@@ -828,8 +1431,10 @@ class TelegramCodexBridge:
         }
         return self.telegram_request("getUpdates", payload).get("result", [])
 
-    def send_message(self, chat_id: str, text: str) -> int | None:
+    def send_message(self, chat_id: str, text: str, reply_markup: dict | None = None) -> int | None:
         payload = {"chat_id": chat_id, "text": text[:4000]}
+        if reply_markup is not None:
+            payload["reply_markup"] = json.dumps(reply_markup)
         self.log_event("BOT", text[:4000])
         try:
             result = self.telegram_request("sendMessage", payload).get("result") or {}
@@ -1021,20 +1626,26 @@ class TelegramCodexBridge:
         has_voice = bool(message.get("voice") or message.get("audio"))
         has_image = self.has_image(message)
         if text:
-            self.log_event("USER", text)
+            self.log_event("USER", self.redact_user_message_for_log(text))
         elif has_voice:
             self.log_event("USER", "<voice message>")
         elif has_image:
             self.log_event("USER", "<image message>")
         if text == "/start":
             self.save_last_activity()
-            self.send_message(chat_id, "Bridge is running. Send a prompt, `/reset`, `/status`, or `/meter`.")
+            self.send_message(
+                chat_id,
+                "Bridge is running. Send a prompt, `/reset`, `/status`, `/meter`, or `/config`.",
+            )
             return
         if text == "/status":
             thread_id = self.load_thread_id()
             status = thread_id if thread_id else "no active Codex thread"
             self.save_last_activity()
             self.send_message(chat_id, f"Status: {status}\nWorkdir: {self.workdir}")
+            return
+        if text.startswith("/config"):
+            self.handle_config_command(chat_id, text)
             return
         if text == "/meter":
             self.save_last_activity()
@@ -1072,7 +1683,9 @@ class TelegramCodexBridge:
         base = ["codex", "-C", self.workdir, "exec"]
         if thread_id:
             base.extend(["resume", thread_id])
-        base.extend(self.codex_flags)
+        base.extend(self.effective_codex_flags())
+        if self.codex_model_override:
+            base.extend(["--model", self.codex_model_override])
         for image_path in image_paths or []:
             base.extend(["--image", image_path])
         base.extend(["--skip-git-repo-check", "--output-last-message"])
@@ -1165,6 +1778,7 @@ class TelegramCodexBridge:
         last_activity_at = started_at
         last_event_at: float | None = None
         last_event_summary: str | None = None
+        active_item_type: str | None = None
         timeout_reason: str | None = None
         timeout_details: str | None = None
         exact_usage: dict | None = None
@@ -1196,6 +1810,12 @@ class TelegramCodexBridge:
                     exact_usage = self.merge_usage_snapshot(exact_usage, self.extract_usage_snapshot(event))
                     last_event_at = last_activity_at
                     last_event_summary = self.summarize_event_brief(event)
+                    item = event.get("item")
+                    item_type = item.get("type") if isinstance(item, dict) else None
+                    if event.get("type") == "item.started":
+                        active_item_type = item_type
+                    elif event.get("type") in {"item.completed", "item.failed"} and active_item_type == item_type:
+                        active_item_type = None
                     if event.get("type") == "thread.started" and event.get("thread_id"):
                         self.save_thread_id(event["thread_id"])
                     summary = self.summarize_event(event)
@@ -1218,6 +1838,7 @@ class TelegramCodexBridge:
                 timeout_details = self.build_timeout_diagnostics(
                     elapsed=elapsed,
                     quiet_for=quiet_for,
+                    idle_timeout=self.current_idle_timeout_seconds(active_item_type),
                     last_event_at=last_event_at,
                     last_event_summary=last_event_summary,
                     recent_output_tail=list(recent_output_tail),
@@ -1232,13 +1853,13 @@ class TelegramCodexBridge:
                     state=progress_state,
                 )
                 break
-            if quiet_for >= self.codex_idle_timeout:
-                timeout_reason = (
-                    f"Codex produced no output for {self.codex_idle_timeout}s and was stopped."
-                )
+            idle_timeout = self.current_idle_timeout_seconds(active_item_type)
+            if quiet_for >= idle_timeout:
+                timeout_reason = f"Codex produced no output for {idle_timeout}s and was stopped."
                 timeout_details = self.build_timeout_diagnostics(
                     elapsed=elapsed,
                     quiet_for=quiet_for,
+                    idle_timeout=idle_timeout,
                     last_event_at=last_event_at,
                     last_event_summary=last_event_summary,
                     recent_output_tail=list(recent_output_tail),
@@ -1299,6 +1920,7 @@ class TelegramCodexBridge:
                 failure_details = self.build_timeout_diagnostics(
                     elapsed=int(time.time() - started_at),
                     quiet_for=int(time.time() - last_activity_at),
+                    idle_timeout=self.current_idle_timeout_seconds(active_item_type),
                     last_event_at=last_event_at,
                     last_event_summary=last_event_summary,
                     recent_output_tail=list(recent_output_tail),

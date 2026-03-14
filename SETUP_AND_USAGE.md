@@ -141,6 +141,9 @@ Typical values include:
 - `TELEGRAM_PASSPHRASE`
   The passphrase required to unlock the bridge after inactivity.
 
+- `TELEGRAM_AUTH_REQUIRED=true`
+  Set to `false` to disable the inactivity lock entirely.
+
 - `CODEX_WORKDIR=/path/to/workdir`
   Codex runs rooted at `/path/to/workdir`.
 
@@ -157,6 +160,9 @@ Typical values include:
 
 - `CODEX_IDLE_TIMEOUT_SECONDS=120`
   Stop a Codex request if it produces no output for too long.
+
+- `CODEX_COMMAND_IDLE_TIMEOUT_SECONDS=600`
+  Allows a longer silent window while Codex is actively executing a command.
 
 - `TELEGRAM_POLL_TIMEOUT=30`
   Long-poll duration for Telegram.
@@ -234,7 +240,8 @@ If that `curl` fails, the bridge will not work.
    If there has been no accepted activity for the configured timeout, the next message must be the configured passphrase before normal commands resume.
 
 9. Handles commands
-   It processes `/start`, `/status`, and `/reset` directly.
+   It processes `/start`, `/status`, `/meter`, `/config`, and `/reset` directly.
+   Runtime config overrides are stored in `state/runtime_config.json`, except `bridge.passphrase`, which stays in memory only for the current process.
 
 10. Runs Codex
    For normal text messages it runs local `codex exec`.
