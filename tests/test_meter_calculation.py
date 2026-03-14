@@ -456,6 +456,7 @@ class ProgressUpdateTests(unittest.TestCase):
     def test_maybe_update_progress_sends_new_messages_in_append_mode(self) -> None:
         bridge = make_bridge()
         bridge.progress_mode = "append"
+        bridge.progress_interval = 15
         bridge.progress_edit_interval = 2.0
         sent_messages: list[tuple[str, str]] = []
         bridge.send_message = lambda chat_id, text, reply_markup=None: sent_messages.append((chat_id, text)) or 1
@@ -469,6 +470,31 @@ class ProgressUpdateTests(unittest.TestCase):
             [("chat-1", "Working..."), ("chat-1", "Still working...")],
         )
         self.assertEqual(state["last_text"], "Still working...")
+
+    def test_maybe_update_progress_throttles_append_mode_messages(self) -> None:
+        bridge = make_bridge()
+        bridge.progress_mode = "append"
+        bridge.progress_interval = 15
+        bridge.progress_edit_interval = 2.0
+        sent_messages: list[tuple[str, str]] = []
+        bridge.send_message = lambda chat_id, text, reply_markup=None: sent_messages.append((chat_id, text)) or 1
+        state = {"last_text": "", "last_edit_at": 100.0}
+
+        import bridge as bridge_module
+
+        original_time = bridge_module.time.time
+        bridge_module.time.time = lambda: 105.0
+        try:
+            bridge.maybe_update_progress(
+                "chat-1",
+                123,
+                "Running Codex...\n\nStill working... 60s elapsed.",
+                state=state,
+            )
+        finally:
+            bridge_module.time.time = original_time
+
+        self.assertEqual(sent_messages, [])
 
     def test_auth_disabled_skips_unlock_gate(self) -> None:
         bridge = self.make_configured_bridge()

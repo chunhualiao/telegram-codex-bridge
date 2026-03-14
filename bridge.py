@@ -1850,16 +1850,19 @@ class TelegramCodexBridge:
         force: bool = False,
         state: dict,
     ) -> None:
+        now = time.time()
         if self.progress_mode == "append":
             if not force and text == state.get("last_text"):
                 return
+            is_heartbeat = text.startswith("Running Codex...\n\nStill working...")
+            if is_heartbeat and not force and now - state.get("last_edit_at", 0.0) < self.progress_interval:
+                return
             self.send_message(chat_id, text)
             state["last_text"] = text
-            state["last_edit_at"] = time.time()
+            state["last_edit_at"] = now
             return
         if not status_message_id:
             return
-        now = time.time()
         if not force:
             if text == state.get("last_text"):
                 return
