@@ -403,6 +403,7 @@ The current security model is simple:
 - only one Telegram chat ID is allowed
 - messages from other chats are ignored
 - the bot token is stored locally in `.env`
+- the bridge keeps `state/` private on disk because logs, queued messages, and transcripts may contain sensitive content
 - Codex runs with the permissions implied by its own flags and your local environment
 
 Important implications:

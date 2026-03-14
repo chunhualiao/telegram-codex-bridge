@@ -31,6 +31,8 @@ STATE_DIR = BASE_DIR / "state"
 ENV_PATH = BASE_DIR / ".env"
 DEFAULT_POLL_TIMEOUT = 30
 DEFAULT_CONFLICT_EXIT_THRESHOLD = 3
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
 
 
 def load_env_file(path: Path) -> None:
@@ -77,7 +79,7 @@ def parse_bool_text(raw: str) -> bool:
 class TelegramCodexBridge:
     def __init__(self) -> None:
         load_env_file(ENV_PATH)
-        STATE_DIR.mkdir(exist_ok=True)
+        self.ensure_private_directory(STATE_DIR)
         self.bot_token = require_env("TELEGRAM_BOT_TOKEN")
         self.allowed_chat_id = require_env("TELEGRAM_ALLOWED_CHAT_ID")
         self.allowed_user_id = require_env("TELEGRAM_ALLOWED_USER_ID")
@@ -133,12 +135,77 @@ class TelegramCodexBridge:
         self.global_lock_dir = Path.home() / ".telegram-bridge-locks"
         self.global_lock_file = self.global_lock_dir / f"{token_fingerprint}.lock"
         self.global_lock_handle = None
+        self.harden_state_paths()
+
+    def ensure_private_directory(self, path: Path) -> None:
+        path.mkdir(mode=PRIVATE_DIR_MODE, exist_ok=True)
+        try:
+            os.chmod(path, PRIVATE_DIR_MODE)
+        except OSError:
+            pass
+
+    def harden_file_permissions(self, path: Path) -> None:
+        try:
+            if path.exists():
+                os.chmod(path, PRIVATE_FILE_MODE)
+        except OSError:
+            pass
+
+    def harden_state_paths(self) -> None:
+        self.ensure_private_directory(STATE_DIR)
+        for path in (
+            self.offset_file,
+            self.thread_file,
+            self.lock_file,
+            self.last_activity_file,
+            self.lock_notice_file,
+            self.pending_message_file,
+            self.transcript_file,
+            self.usage_meter_file,
+            self.pricing_cache_file,
+            self.runtime_config_file,
+        ):
+            self.harden_file_permissions(path)
+
+    def write_private_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE), "w", encoding=encoding) as fh:
+            fh.write(text)
+        self.harden_file_permissions(path)
+
+    def write_private_bytes(self, path: Path, data: bytes) -> None:
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, PRIVATE_FILE_MODE), "wb") as fh:
+            fh.write(data)
+        self.harden_file_permissions(path)
+
+    def append_private_text(self, path: Path, text: str, *, encoding: str = "utf-8") -> None:
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, PRIVATE_FILE_MODE), "a", encoding=encoding) as fh:
+            fh.write(text)
+        self.harden_file_permissions(path)
+
+    def sanitize_sensitive_text(self, text: str) -> str:
+        sanitized = text
+        bot_token = getattr(self, "bot_token", "").strip()
+        openai_api_key = getattr(self, "openai_api_key", "").strip()
+        sanitized = re.sub(
+            r"Bearer\s+[A-Za-z0-9._-]+",
+            "Bearer [redacted]",
+            sanitized,
+        )
+        if bot_token:
+            sanitized = sanitized.replace(bot_token, "[redacted-telegram-token]")
+        if openai_api_key:
+            sanitized = sanitized.replace(openai_api_key, "[redacted-openai-key]")
+        sanitized = re.sub(
+            r"https://api\.telegram\.org/(?:file/)?bot[^/\s]+",
+            "https://api.telegram.org/bot[redacted-telegram-token]",
+            sanitized,
+        )
+        return sanitized
 
     def log_event(self, kind: str, text: str) -> None:
-        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {kind}: {text}".replace("\r", " ").strip()
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {kind}: {self.sanitize_sensitive_text(text)}".replace("\r", " ").strip()
         print(line, flush=True)
-        with self.transcript_file.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+        self.append_private_text(self.transcript_file, line + "\n")
 
     def format_recent_output_tail(self, lines: list[str]) -> str:
         snippets: list[str] = []
@@ -515,7 +582,7 @@ class TelegramCodexBridge:
             if spec is None:
                 continue
             persisted[key] = value
-        self.runtime_config_file.write_text(json.dumps(persisted, indent=2, sort_keys=True), encoding="utf-8")
+        self.write_private_text(self.runtime_config_file, json.dumps(persisted, indent=2, sort_keys=True), encoding="utf-8")
 
     def apply_runtime_config(self, overrides: dict) -> None:
         specs = self.runtime_config_specs()
@@ -830,7 +897,7 @@ class TelegramCodexBridge:
                     pass
                 else:
                     raise SystemExit(f"Bridge already running with PID {pid}")
-        self.lock_file.write_text(str(os.getpid()))
+        self.write_private_text(self.lock_file, str(os.getpid()))
         atexit.register(self.release_lock)
 
     def release_lock(self) -> None:
@@ -873,7 +940,7 @@ class TelegramCodexBridge:
         return int(raw) if raw.isdigit() else 0
 
     def save_offset(self, offset: int) -> None:
-        self.offset_file.write_text(str(offset))
+        self.write_private_text(self.offset_file, str(offset))
 
     def verify_polling_ready(self, offset: int) -> int:
         try:
@@ -938,7 +1005,7 @@ class TelegramCodexBridge:
     def save_last_activity(self, timestamp: float | None = None) -> None:
         if timestamp is None:
             timestamp = time.time()
-        self.last_activity_file.write_text(str(timestamp))
+        self.write_private_text(self.last_activity_file, str(timestamp))
 
     def clear_last_activity(self) -> None:
         self.last_activity_file.unlink(missing_ok=True)
@@ -955,7 +1022,7 @@ class TelegramCodexBridge:
     def save_lock_notice(self, timestamp: float | None = None) -> None:
         if timestamp is None:
             timestamp = time.time()
-        self.lock_notice_file.write_text(str(timestamp))
+        self.write_private_text(self.lock_notice_file, str(timestamp))
 
     def clear_lock_notice(self) -> None:
         self.lock_notice_file.unlink(missing_ok=True)
@@ -971,7 +1038,7 @@ class TelegramCodexBridge:
         return payload if isinstance(payload, dict) else None
 
     def save_pending_message(self, message: dict) -> None:
-        self.pending_message_file.write_text(json.dumps(message), encoding="utf-8")
+        self.write_private_text(self.pending_message_file, json.dumps(message), encoding="utf-8")
 
     def clear_pending_message(self) -> None:
         self.pending_message_file.unlink(missing_ok=True)
@@ -989,7 +1056,7 @@ class TelegramCodexBridge:
         return (time.time() - last_activity) >= self.inactivity_timeout
 
     def save_thread_id(self, thread_id: str) -> None:
-        self.thread_file.write_text(thread_id)
+        self.write_private_text(self.thread_file, thread_id)
 
     def clear_thread_id(self) -> None:
         if self.thread_file.exists():
@@ -1025,7 +1092,7 @@ class TelegramCodexBridge:
         return meter
 
     def save_usage_meter(self, meter: dict) -> None:
-        self.usage_meter_file.write_text(json.dumps(meter, indent=2, sort_keys=True), encoding="utf-8")
+        self.write_private_text(self.usage_meter_file, json.dumps(meter, indent=2, sort_keys=True), encoding="utf-8")
 
     def estimate_tokens(self, text: str) -> int:
         text = text.strip()
@@ -1056,7 +1123,7 @@ class TelegramCodexBridge:
         return payload if isinstance(payload, dict) else {}
 
     def save_pricing_cache(self, cache: dict) -> None:
-        self.pricing_cache_file.write_text(json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
+        self.write_private_text(self.pricing_cache_file, json.dumps(cache, indent=2, sort_keys=True), encoding="utf-8")
 
     def read_url_text(self, url: str) -> str:
         req = urllib.request.Request(url, headers={"User-Agent": "telegram-codex-bridge/1.0"})
@@ -1440,8 +1507,9 @@ class TelegramCodexBridge:
             result = self.telegram_request("sendMessage", payload).get("result") or {}
             return result.get("message_id")
         except Exception as exc:
-            self.log_event("WARN", f"Failed to send Telegram message: {exc}")
-            print(f"Failed to send Telegram message: {exc}", file=sys.stderr)
+            sanitized = self.sanitize_sensitive_text(str(exc))
+            self.log_event("WARN", f"Failed to send Telegram message: {sanitized}")
+            print(f"Failed to send Telegram message: {sanitized}", file=sys.stderr)
             return None
 
     def edit_message(self, chat_id: str, message_id: int, text: str) -> None:
@@ -1463,7 +1531,7 @@ class TelegramCodexBridge:
                 url = f"{self.file_base}/{file_path}"
                 with urllib.request.urlopen(url, timeout=self.poll_timeout + 30) as resp:
                     data = resp.read()
-                dest.write_bytes(data)
+                self.write_private_bytes(dest, data)
                 return dest
             except Exception as exc:
                 last_error = exc
@@ -1523,41 +1591,69 @@ class TelegramCodexBridge:
             raise RuntimeError(f"ffmpeg audio conversion failed.\n\n{tail}")
         return dest
 
+    def build_multipart_form_data(
+        self,
+        *,
+        fields: dict[str, str],
+        files: list[tuple[str, str, bytes, str]],
+    ) -> tuple[bytes, str]:
+        boundary = f"telegram-bridge-{hashlib.sha256(os.urandom(16)).hexdigest()[:24]}"
+        body = bytearray()
+        for key, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
+            body.extend(value.encode("utf-8"))
+            body.extend(b"\r\n")
+        for field_name, filename, data, content_type in files:
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(
+                (
+                    f'Content-Disposition: form-data; name="{field_name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("utf-8")
+            )
+            body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+            body.extend(data)
+            body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+        return bytes(body), boundary
+
     def transcribe_audio(self, source: Path) -> str:
         if not self.openai_api_key:
             raise RuntimeError("Voice support requires OPENAI_API_KEY in .env.")
-        cmd = [
-            "curl",
-            "-sS",
-            "https://api.openai.com/v1/audio/transcriptions",
-            "-H",
-            f"Authorization: Bearer {self.openai_api_key}",
-            "-F",
-            f"file=@{source}",
-            "-F",
-            f"model={self.transcribe_model}",
-        ]
+        fields = {"model": self.transcribe_model}
         if self.transcribe_prompt:
-            cmd.extend(["-F", f"prompt={self.transcribe_prompt}"])
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
+            fields["prompt"] = self.transcribe_prompt
+        body, boundary = self.build_multipart_form_data(
+            fields=fields,
+            files=[("file", source.name, source.read_bytes(), "audio/wav")],
         )
-        if proc.returncode != 0:
-            tail = proc.stdout.strip()[-1000:] if proc.stdout.strip() else "curl exited without output."
-            raise RuntimeError(f"OpenAI transcription request failed.\n\n{tail}")
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {self.openai_api_key}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(body)),
+            },
+        )
         try:
-            payload = json.loads(proc.stdout)
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                raw_body = resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            raw_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"OpenAI transcription request failed.\n\n{self.sanitize_sensitive_text(raw_body[-1000:])}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"OpenAI transcription request failed.\n\n{self.sanitize_sensitive_text(str(exc))}") from exc
+        try:
+            payload = json.loads(raw_body)
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"Could not parse transcription response: {exc}") from exc
         text = (payload.get("text") or "").strip()
         if text:
             return text
         if payload.get("error"):
-            message = payload["error"].get("message") or proc.stdout
+            message = payload["error"].get("message") or raw_body
             raise RuntimeError(f"OpenAI transcription error: {message}")
         raise RuntimeError("OpenAI transcription returned no text.")
 

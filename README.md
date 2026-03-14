@@ -53,6 +53,8 @@ Before you start, make sure the target computer has:
 - outbound network access to Telegram and Codex
 - outbound network access to `api.openai.com` for voice transcription
 
+The bridge keeps `state/` and its runtime files private on disk (`700` for the directory, `600` for files) because logs and queued messages can contain sensitive content.
+
 Quick checks:
 
 ```bash
@@ -456,6 +458,8 @@ The log includes:
 - `CODEX:` Codex execution milestones
 - `BOT:` outgoing bot replies
 - `ERROR:` bridge, transcription, or Codex failures
+
+These logs can contain sensitive prompts, replies, and transcripts. Keep them local and treat `state/` as private runtime data.
 
 ## Running In The Background
 
