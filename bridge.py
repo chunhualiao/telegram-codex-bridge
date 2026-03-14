@@ -112,6 +112,7 @@ class TelegramCodexBridge:
         self.runtime_config_file = STATE_DIR / "runtime_config.json"
         self.progress_interval = int(os.environ.get("TELEGRAM_PROGRESS_INTERVAL", "15"))
         self.progress_edit_interval = float(os.environ.get("TELEGRAM_PROGRESS_EDIT_INTERVAL", "2"))
+        self.progress_mode = os.environ.get("TELEGRAM_PROGRESS_MODE", "edit").strip().lower() or "edit"
         self.inactivity_timeout = int(os.environ.get("TELEGRAM_INACTIVITY_TIMEOUT_SECONDS", "3600"))
         self.codex_max_runtime = int(os.environ.get("CODEX_MAX_RUNTIME_SECONDS", "900"))
         self.codex_idle_timeout = int(os.environ.get("CODEX_IDLE_TIMEOUT_SECONDS", "120"))
@@ -233,6 +234,19 @@ class TelegramCodexBridge:
             return max(self.codex_idle_timeout, self.codex_command_idle_timeout)
         return self.codex_idle_timeout
 
+    def infer_active_item_type(
+        self,
+        *,
+        active_item_type: str | None,
+        last_event_type: str | None,
+        last_event_item_type: str | None,
+    ) -> str | None:
+        if active_item_type:
+            return active_item_type
+        if last_event_item_type == "command_execution" and last_event_type not in {"item.completed", "item.failed"}:
+            return "command_execution"
+        return None
+
     def build_timeout_diagnostics(
         self,
         *,
@@ -270,6 +284,7 @@ class TelegramCodexBridge:
             "codex.idle_timeout_seconds": self.codex_idle_timeout,
             "codex.command_idle_timeout_seconds": self.codex_command_idle_timeout,
             "bridge.poll_timeout_seconds": self.poll_timeout,
+            "bridge.progress_mode": self.progress_mode,
             "bridge.progress_interval_seconds": self.progress_interval,
             "bridge.progress_edit_interval_seconds": self.progress_edit_interval,
             "bridge.inactivity_timeout_seconds": self.inactivity_timeout,
@@ -316,6 +331,12 @@ class TelegramCodexBridge:
                 "parser": lambda raw: self.parse_config_int(raw, minimum=1),
                 "formatter": str,
                 "help": "Telegram long-poll timeout in seconds.",
+            },
+            "bridge.progress_mode": {
+                "attr": "progress_mode",
+                "parser": self.parse_config_progress_mode,
+                "formatter": self.format_config_string,
+                "help": "How progress updates are delivered: edit reuses one message, append sends new messages.",
             },
             "bridge.progress_edit_interval_seconds": {
                 "attr": "progress_edit_interval",
@@ -427,6 +448,7 @@ class TelegramCodexBridge:
             "model": "codex.model",
             "passphrase": "bridge.passphrase",
             "poll_timeout": "bridge.poll_timeout_seconds",
+            "progress_mode": "bridge.progress_mode",
             "price_input": "meter.price_input_per_1m_tokens",
             "price_lookup": "meter.price_lookup",
             "price_model": "meter.price_model",
@@ -469,6 +491,12 @@ class TelegramCodexBridge:
         value = raw.strip().lower()
         if value not in {"auto", "manual", "openai", "openrouter"}:
             raise ValueError("Allowed values: auto, manual, openai, openrouter")
+        return value
+
+    def parse_config_progress_mode(self, raw: str) -> str:
+        value = raw.strip().lower()
+        if value not in {"edit", "append"}:
+            raise ValueError("Allowed values: edit, append")
         return value
 
     def parse_runtime_config_raw_value(self, key: str, raw_value: object) -> object:
@@ -689,10 +717,12 @@ class TelegramCodexBridge:
                 [
                     ["/config show bridge.auth_required", "/config set bridge.auth_required true"],
                     ["/config set bridge.auth_required false", "/config show bridge.passphrase"],
+                    ["/config show bridge.progress_mode", "/config set bridge.progress_mode append"],
                     ["/config show bridge.poll_timeout_seconds", "/config show bridge.inactivity_timeout_seconds"],
-                    ["/config show bridge.progress_interval_seconds", "/config show bridge.progress_edit_interval_seconds"],
-                    ["/config show bridge.conflict_exit_threshold", "/config menu presets"],
-                    ["/config", "/config hide"],
+                    ["/config set bridge.progress_mode edit", "/config show bridge.progress_interval_seconds"],
+                    ["/config show bridge.progress_edit_interval_seconds", "/config show bridge.conflict_exit_threshold"],
+                    ["/config menu presets", "/config"],
+                    ["/config hide"],
                 ]
             )
         if normalized == "meter":
@@ -715,6 +745,7 @@ class TelegramCodexBridge:
             return self.build_reply_keyboard(
                 [
                     ["/config set codex.idle_timeout_seconds 300", "/config set codex.max_runtime_seconds 1800"],
+                    ["/config set bridge.progress_mode append", "/config set bridge.progress_mode edit"],
                     ["/config set bridge.progress_interval_seconds 30", "/config set bridge.progress_edit_interval_seconds 5"],
                     ["/config set meter.price_lookup auto", "/config set meter.price_lookup manual"],
                     ["/config", "/config hide"],
@@ -1819,6 +1850,13 @@ class TelegramCodexBridge:
         force: bool = False,
         state: dict,
     ) -> None:
+        if self.progress_mode == "append":
+            if not force and text == state.get("last_text"):
+                return
+            self.send_message(chat_id, text)
+            state["last_text"] = text
+            state["last_edit_at"] = time.time()
+            return
         if not status_message_id:
             return
         now = time.time()
@@ -1873,6 +1911,8 @@ class TelegramCodexBridge:
         started_at = time.time()
         last_activity_at = started_at
         last_event_at: float | None = None
+        last_event_type: str | None = None
+        last_event_item_type: str | None = None
         last_event_summary: str | None = None
         active_item_type: str | None = None
         timeout_reason: str | None = None
@@ -1905,9 +1945,11 @@ class TelegramCodexBridge:
                         continue
                     exact_usage = self.merge_usage_snapshot(exact_usage, self.extract_usage_snapshot(event))
                     last_event_at = last_activity_at
+                    last_event_type = str(event.get("type") or "")
                     last_event_summary = self.summarize_event_brief(event)
                     item = event.get("item")
                     item_type = item.get("type") if isinstance(item, dict) else None
+                    last_event_item_type = item_type
                     if event.get("type") == "item.started":
                         active_item_type = item_type
                     elif event.get("type") in {"item.completed", "item.failed"} and active_item_type == item_type:
@@ -1927,6 +1969,11 @@ class TelegramCodexBridge:
                 break
             elapsed = int(time.time() - started_at)
             quiet_for = int(time.time() - last_activity_at)
+            effective_item_type = self.infer_active_item_type(
+                active_item_type=active_item_type,
+                last_event_type=last_event_type,
+                last_event_item_type=last_event_item_type,
+            )
             if elapsed >= self.codex_max_runtime:
                 timeout_reason = (
                     f"Codex exceeded the maximum runtime of {self.codex_max_runtime}s and was stopped."
@@ -1934,7 +1981,7 @@ class TelegramCodexBridge:
                 timeout_details = self.build_timeout_diagnostics(
                     elapsed=elapsed,
                     quiet_for=quiet_for,
-                    idle_timeout=self.current_idle_timeout_seconds(active_item_type),
+                    idle_timeout=self.current_idle_timeout_seconds(effective_item_type),
                     last_event_at=last_event_at,
                     last_event_summary=last_event_summary,
                     recent_output_tail=list(recent_output_tail),
@@ -1949,7 +1996,7 @@ class TelegramCodexBridge:
                     state=progress_state,
                 )
                 break
-            idle_timeout = self.current_idle_timeout_seconds(active_item_type)
+            idle_timeout = self.current_idle_timeout_seconds(effective_item_type)
             if quiet_for >= idle_timeout:
                 timeout_reason = f"Codex produced no output for {idle_timeout}s and was stopped."
                 timeout_details = self.build_timeout_diagnostics(
@@ -2016,7 +2063,13 @@ class TelegramCodexBridge:
                 failure_details = self.build_timeout_diagnostics(
                     elapsed=int(time.time() - started_at),
                     quiet_for=int(time.time() - last_activity_at),
-                    idle_timeout=self.current_idle_timeout_seconds(active_item_type),
+                    idle_timeout=self.current_idle_timeout_seconds(
+                        self.infer_active_item_type(
+                            active_item_type=active_item_type,
+                            last_event_type=last_event_type,
+                            last_event_item_type=last_event_item_type,
+                        )
+                    ),
                     last_event_at=last_event_at,
                     last_event_summary=last_event_summary,
                     recent_output_tail=list(recent_output_tail),

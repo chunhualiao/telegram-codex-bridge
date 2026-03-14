@@ -292,6 +292,7 @@ class RuntimeConfigTests(unittest.TestCase):
         bridge.codex_idle_timeout = 120
         bridge.codex_command_idle_timeout = 600
         bridge.poll_timeout = 30
+        bridge.progress_mode = "edit"
         bridge.progress_interval = 15
         bridge.progress_edit_interval = 2.0
         bridge.auth_required = True
@@ -350,6 +351,30 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(bridge.current_idle_timeout_seconds("agent_message"), 120)
         self.assertEqual(bridge.current_idle_timeout_seconds(None), 120)
 
+    def test_infer_active_item_type_recovers_command_execution_from_last_event(self) -> None:
+        bridge = self.make_configured_bridge()
+
+        inferred = bridge.infer_active_item_type(
+            active_item_type=None,
+            last_event_type="item.started",
+            last_event_item_type="command_execution",
+        )
+
+        self.assertEqual(inferred, "command_execution")
+        self.assertEqual(bridge.current_idle_timeout_seconds(inferred), 600)
+
+    def test_infer_active_item_type_does_not_extend_completed_command_execution(self) -> None:
+        bridge = self.make_configured_bridge()
+
+        inferred = bridge.infer_active_item_type(
+            active_item_type=None,
+            last_event_type="item.completed",
+            last_event_item_type="command_execution",
+        )
+
+        self.assertIsNone(inferred)
+        self.assertEqual(bridge.current_idle_timeout_seconds(inferred), 120)
+
     def test_handle_config_command_reports_unknown_key(self) -> None:
         bridge = self.make_configured_bridge()
         sent_messages: list[str] = []
@@ -369,7 +394,81 @@ class RuntimeConfigTests(unittest.TestCase):
         labels = [button["text"] for row in markup["keyboard"] for button in row]
         self.assertIn("/config show bridge.auth_required", labels)
         self.assertIn("/config set bridge.auth_required false", labels)
+        self.assertIn("/config show bridge.progress_mode", labels)
+        self.assertIn("/config set bridge.progress_mode append", labels)
         self.assertIn("/config hide", labels)
+
+    def test_set_runtime_config_value_updates_progress_mode(self) -> None:
+        bridge = self.make_configured_bridge()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bridge.runtime_config_file = Path(temp_dir) / "runtime_config.json"
+
+            key, value = bridge.set_runtime_config_value("bridge.progress_mode", "append")
+
+            self.assertEqual(key, "bridge.progress_mode")
+            self.assertEqual(value, "append")
+            self.assertEqual(bridge.progress_mode, "append")
+
+
+class ProgressUpdateTests(unittest.TestCase):
+    def make_configured_bridge(self) -> TelegramCodexBridge:
+        bridge = make_bridge()
+        bridge.workdir = "/tmp/workdir"
+        bridge.codex_flags = ["--full-auto", "--json"]
+        bridge.codex_model_override = ""
+        bridge.system_prompt = "default prompt"
+        bridge.codex_max_runtime = 900
+        bridge.codex_idle_timeout = 120
+        bridge.codex_command_idle_timeout = 600
+        bridge.poll_timeout = 30
+        bridge.progress_mode = "edit"
+        bridge.progress_interval = 15
+        bridge.progress_edit_interval = 2.0
+        bridge.auth_required = True
+        bridge.passphrase = "secret-passphrase"
+        bridge.inactivity_timeout = 3600
+        bridge.conflict_exit_threshold = 3
+        bridge.transcribe_model = "whisper-1"
+        bridge.transcribe_prompt = "transcribe prompt"
+        bridge.meter_price_model = ""
+        bridge.meter_price_input_per_million = 0.0
+        bridge.meter_price_output_per_million = 0.0
+        bridge.pricing_lookup_preference = "auto"
+        bridge.pricing_cache_ttl_seconds = 86400
+        bridge.config_defaults = bridge.capture_runtime_config_defaults()
+        bridge.runtime_config_overrides = {}
+        bridge.detected_model_name = bridge.detect_model_name()
+        return bridge
+
+    def test_maybe_update_progress_edits_status_message_in_edit_mode(self) -> None:
+        bridge = make_bridge()
+        bridge.progress_mode = "edit"
+        bridge.progress_edit_interval = 2.0
+        edits: list[tuple[str, int, str]] = []
+        bridge.edit_message = lambda chat_id, message_id, text: edits.append((chat_id, message_id, text))
+        state = {"last_text": "", "last_edit_at": 0.0}
+
+        bridge.maybe_update_progress("chat-1", 123, "Working...", force=True, state=state)
+
+        self.assertEqual(edits, [("chat-1", 123, "Working...")])
+        self.assertEqual(state["last_text"], "Working...")
+
+    def test_maybe_update_progress_sends_new_messages_in_append_mode(self) -> None:
+        bridge = make_bridge()
+        bridge.progress_mode = "append"
+        bridge.progress_edit_interval = 2.0
+        sent_messages: list[tuple[str, str]] = []
+        bridge.send_message = lambda chat_id, text, reply_markup=None: sent_messages.append((chat_id, text)) or 1
+        state = {"last_text": "", "last_edit_at": 0.0}
+
+        bridge.maybe_update_progress("chat-1", 123, "Working...", force=True, state=state)
+        bridge.maybe_update_progress("chat-1", 123, "Still working...", state=state)
+
+        self.assertEqual(
+            sent_messages,
+            [("chat-1", "Working..."), ("chat-1", "Still working...")],
+        )
+        self.assertEqual(state["last_text"], "Still working...")
 
     def test_auth_disabled_skips_unlock_gate(self) -> None:
         bridge = self.make_configured_bridge()
