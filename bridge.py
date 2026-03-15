@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import atexit
 import fcntl
@@ -136,6 +137,11 @@ class TelegramCodexBridge:
         self.global_lock_dir = Path.home() / ".telegram-bridge-locks"
         self.global_lock_file = self.global_lock_dir / f"{token_fingerprint}.lock"
         self.global_lock_handle = None
+        self.jobs_lock = threading.Lock()
+        self.jobs: dict[str, dict] = {}
+        self.recent_job_ids: list[str] = []
+        self.next_job_number = 0
+        self.interactive_job_id: str | None = None
         self.harden_state_paths()
 
     def ensure_private_directory(self, path: Path) -> None:
@@ -839,6 +845,208 @@ class TelegramCodexBridge:
             "`/config set <key> <value>`, `/config unset <key>`, `/config menu <section>`, or `/config reset`.",
             reply_markup=self.config_menu_markup(),
         )
+
+    def next_job_id(self) -> str:
+        with self.jobs_lock:
+            self.next_job_number += 1
+            return f"job-{self.next_job_number}"
+
+    def get_job_snapshot(self, job_id: str) -> dict | None:
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            return dict(job) if job is not None else None
+
+    def get_active_interactive_job_id(self) -> str | None:
+        with self.jobs_lock:
+            job_id = self.interactive_job_id
+            if not job_id:
+                return None
+            job = self.jobs.get(job_id)
+            if job is None or job.get("status") not in {"queued", "running"}:
+                if self.interactive_job_id == job_id:
+                    self.interactive_job_id = None
+                return None
+            return job_id
+
+    def note_finished_job(self, job_id: str) -> None:
+        with self.jobs_lock:
+            if self.interactive_job_id == job_id:
+                self.interactive_job_id = None
+            self.recent_job_ids = [existing for existing in self.recent_job_ids if existing != job_id]
+            self.recent_job_ids.append(job_id)
+            self.recent_job_ids = self.recent_job_ids[-20:]
+
+    def is_job_cancel_requested(self, job_id: str) -> bool:
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            return bool(job and job.get("cancel_requested"))
+
+    def format_job_status_line(self, job: dict) -> str:
+        status = str(job.get("status") or "unknown")
+        if job.get("cancel_requested") and status in {"queued", "running"}:
+            status = "canceling"
+        kind = str(job.get("kind") or "job")
+        preview = str(job.get("prompt_preview") or "").strip() or "(no prompt preview)"
+        return f"{job['id']} [{kind}] {status}: {preview}"
+
+    def format_jobs_overview(self) -> str:
+        active_jobs: list[dict] = []
+        recent_jobs: list[dict] = []
+        with self.jobs_lock:
+            for job in self.jobs.values():
+                if job.get("status") in {"queued", "running"}:
+                    active_jobs.append(dict(job))
+            for job_id in reversed(self.recent_job_ids):
+                job = self.jobs.get(job_id)
+                if job is not None:
+                    recent_jobs.append(dict(job))
+        lines = ["Bridge jobs"]
+        if active_jobs:
+            lines.append("Active:")
+            for job in sorted(active_jobs, key=lambda item: int(item["id"].split("-")[1])):
+                lines.append(self.format_job_status_line(job))
+        else:
+            lines.append("Active: none")
+        if recent_jobs:
+            lines.append("")
+            lines.append("Recent:")
+            for job in recent_jobs[:5]:
+                lines.append(self.format_job_status_line(job))
+        return "\n".join(lines)
+
+    def start_codex_job(
+        self,
+        *,
+        chat_id: str,
+        prompt: str,
+        kind: str,
+        image_message: dict | None = None,
+    ) -> tuple[str | None, str]:
+        if kind == "interactive":
+            active_job_id = self.get_active_interactive_job_id()
+            if active_job_id:
+                return None, (
+                    f"Interactive lane is busy with {active_job_id}. "
+                    "Use `/jobs`, `/cancel <job_id>`, or `/spawn <prompt>` for a detached job."
+                )
+        job_id = self.next_job_id()
+        now = time.time()
+        prompt_preview = prompt.strip().replace("\n", " ")
+        if len(prompt_preview) > 80:
+            prompt_preview = prompt_preview[:77] + "..."
+        job = {
+            "id": job_id,
+            "chat_id": chat_id,
+            "kind": kind,
+            "status": "queued",
+            "created_at": now,
+            "started_at": None,
+            "finished_at": None,
+            "prompt_preview": prompt_preview,
+            "cancel_requested": False,
+            "result_preview": "",
+        }
+        with self.jobs_lock:
+            self.jobs[job_id] = job
+            if kind == "interactive":
+                self.interactive_job_id = job_id
+        worker = threading.Thread(
+            target=self.run_codex_job_worker,
+            args=(job_id, prompt, image_message),
+            daemon=True,
+            name=f"telegram-codex-{job_id}",
+        )
+        worker.start()
+        if kind == "interactive":
+            return job_id, f"Started interactive job {job_id}. I will send progress and the final reply here."
+        return job_id, f"Started background job {job_id}. I will send progress and the final result here."
+
+    def choose_job_kind(self, prompt: str, *, has_image: bool = False, has_voice: bool = False) -> tuple[str, str]:
+        normalized = prompt.strip().lower()
+        long_running_markers = (
+            "tune",
+            "tuning",
+            "iterate",
+            "iteration",
+            "refine",
+            "refinement",
+            "batch",
+            "variants",
+            "multiple candidates",
+            "run until",
+            "keep trying",
+            "grid search",
+            "sweep",
+            "generate multiple",
+            "long-running",
+            "background",
+            "reproduction",
+            "round 2",
+            "round 3",
+            "article illustrator",
+            "illustrations",
+        )
+        if any(marker in normalized for marker in long_running_markers):
+            return "background", "Auto-dispatch picked background because this looks like a long-running tuning or batch task."
+        if len(prompt.strip()) >= 800:
+            return "background", "Auto-dispatch picked background because the prompt is unusually long."
+        if has_image or has_voice:
+            return "interactive", "Auto-dispatch kept this in the interactive lane because multimodal requests benefit from direct back-and-forth."
+        return "interactive", "Auto-dispatch kept this in the interactive lane."
+
+    def run_codex_job_worker(self, job_id: str, prompt: str, image_message: dict | None) -> None:
+        job = self.get_job_snapshot(job_id)
+        if job is None:
+            return
+        chat_id = str(job["chat_id"])
+        kind = str(job["kind"])
+        with self.jobs_lock:
+            current = self.jobs.get(job_id)
+            if current is not None:
+                current["status"] = "running"
+                current["started_at"] = time.time()
+        status_message_id = self.send_message(chat_id, f"Running Codex for {job_id}...")
+        try:
+            thread_id = self.load_thread_id() if kind == "interactive" else None
+            reply, usage = self.run_codex(
+                prompt,
+                chat_id=chat_id,
+                status_message_id=status_message_id,
+                image_message=image_message,
+                thread_id=thread_id,
+                persist_thread=(kind == "interactive"),
+                should_cancel=lambda: self.is_job_cancel_requested(job_id),
+            )
+            self.record_usage(usage)
+            with self.jobs_lock:
+                current = self.jobs.get(job_id)
+                if current is not None:
+                    current["status"] = "canceled" if self.is_job_cancel_requested(job_id) else "completed"
+                    current["finished_at"] = time.time()
+                    current["result_preview"] = reply[:200]
+            if kind == "interactive":
+                self.send_message(chat_id, f"[{job_id}]\n\n{reply}")
+            else:
+                self.send_message(chat_id, f"[{job_id}] Background job finished.\n\n{reply}")
+        except Exception as exc:
+            with self.jobs_lock:
+                current = self.jobs.get(job_id)
+                if current is not None:
+                    current["status"] = "failed"
+                    current["finished_at"] = time.time()
+                    current["result_preview"] = str(exc)[:200]
+            self.log_event("ERROR", f"Background Codex job {job_id} failed: {exc}")
+            self.send_message(chat_id, f"[{job_id}] Job failed.\n\n{exc}")
+        finally:
+            self.note_finished_job(job_id)
+
+    def cancel_job(self, job_id: str) -> bool:
+        with self.jobs_lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.get("status") not in {"queued", "running"}:
+                return False
+            job["cancel_requested"] = True
+            return True
 
     def effective_codex_flags(self) -> list[str]:
         flags = list(self.codex_flags)
@@ -1762,14 +1970,32 @@ class TelegramCodexBridge:
             self.save_last_activity()
             self.send_message(
                 chat_id,
-                "Bridge is running. Send a prompt, `/reset`, `/status`, `/meter`, or `/config`.",
+                "Bridge is running. Send a prompt, `/ask <prompt>`, `/spawn <prompt>`, `/jobs`, `/cancel <job_id>`, `/reset`, `/status`, `/meter`, or `/config`.",
             )
             return
         if text == "/status":
             thread_id = self.load_thread_id()
             status = thread_id if thread_id else "no active Codex thread"
             self.save_last_activity()
-            self.send_message(chat_id, f"Status: {status}\nWorkdir: {self.workdir}")
+            active_job_id = self.get_active_interactive_job_id()
+            lane = active_job_id if active_job_id else "idle"
+            self.send_message(chat_id, f"Status: {status}\nInteractive lane: {lane}\nWorkdir: {self.workdir}")
+            return
+        if text == "/jobs":
+            self.save_last_activity()
+            self.send_message(chat_id, self.format_jobs_overview())
+            return
+        if text.startswith("/cancel"):
+            self.save_last_activity()
+            parts = text.split(None, 1)
+            target_job_id = parts[1].strip() if len(parts) == 2 else (self.get_active_interactive_job_id() or "")
+            if not target_job_id:
+                self.send_message(chat_id, "Usage: `/cancel <job_id>` or `/cancel` to cancel the active interactive job.")
+                return
+            if self.cancel_job(target_job_id):
+                self.send_message(chat_id, f"Cancellation requested for {target_job_id}.")
+            else:
+                self.send_message(chat_id, f"No active job found for {target_job_id}.")
             return
         if text.startswith("/config"):
             self.handle_config_command(chat_id, text)
@@ -1779,6 +2005,10 @@ class TelegramCodexBridge:
             self.send_message(chat_id, self.format_usage_report())
             return
         if text == "/reset":
+            active_job_id = self.get_active_interactive_job_id()
+            if active_job_id:
+                self.send_message(chat_id, f"Interactive lane is busy with {active_job_id}. Cancel it or wait before resetting the saved thread.")
+                return
             self.clear_thread_id()
             self.save_last_activity()
             self.send_message(chat_id, "Cleared the saved Codex thread. The next message starts a new session.")
@@ -1794,19 +2024,51 @@ class TelegramCodexBridge:
                 return
         if has_image and not text:
             text = "Please inspect the attached image and describe or answer based on it."
-        status_message_id = self.send_message(chat_id, "Running Codex...")
-        reply, usage = self.run_codex(
-            text,
+        if text.startswith("/spawn "):
+            prompt = text[7:].strip()
+            if not prompt:
+                self.send_message(chat_id, "Usage: `/spawn <prompt>`")
+                return
+            self.save_last_activity()
+            _, response = self.start_codex_job(
+                chat_id=chat_id,
+                prompt=prompt,
+                kind="background",
+                image_message=message if has_image else None,
+            )
+            self.send_message(chat_id, response)
+            return
+        if text.startswith("/ask "):
+            prompt = text[5:].strip()
+            if not prompt:
+                self.send_message(chat_id, "Usage: `/ask <prompt>`")
+                return
+            self.save_last_activity()
+            _, response = self.start_codex_job(
+                chat_id=chat_id,
+                prompt=prompt,
+                kind="interactive",
+                image_message=message if has_image else None,
+            )
+            self.send_message(chat_id, response)
+            return
+        kind, reason = self.choose_job_kind(text, has_image=has_image, has_voice=has_voice)
+        self.save_last_activity()
+        _, response = self.start_codex_job(
             chat_id=chat_id,
-            status_message_id=status_message_id,
+            prompt=text,
+            kind=kind,
             image_message=message if has_image else None,
         )
-        self.record_usage(usage)
-        self.save_last_activity()
-        self.send_message(chat_id, reply)
+        self.send_message(chat_id, f"{reason}\n\n{response}")
 
-    def build_command(self, prompt: str, image_paths: list[str] | None = None) -> list[str]:
-        thread_id = self.load_thread_id()
+    def build_command(
+        self,
+        prompt: str,
+        image_paths: list[str] | None = None,
+        *,
+        thread_id: str | None = None,
+    ) -> list[str]:
         base = ["codex", "-C", self.workdir, "exec"]
         if thread_id:
             base.extend(["resume", thread_id])
@@ -1879,12 +2141,15 @@ class TelegramCodexBridge:
         chat_id: str,
         status_message_id: int | None,
         image_message: dict | None = None,
+        thread_id: str | None = None,
+        persist_thread: bool = True,
+        should_cancel: callable | None = None,
     ) -> tuple[str, dict]:
         with tempfile.NamedTemporaryFile(prefix="codex-last-message-", delete=False) as tmp:
             output_path = tmp.name
         temp_dir_obj: tempfile.TemporaryDirectory[str] | None = None
         image_paths: list[str] = []
-        thread_before = self.load_thread_id()
+        thread_before = thread_id
         full_prompt = prompt
         if not thread_before and self.system_prompt:
             full_prompt = f"{self.system_prompt}\n\nUser message from Telegram:\n{prompt}"
@@ -1892,7 +2157,7 @@ class TelegramCodexBridge:
             temp_dir_obj = tempfile.TemporaryDirectory(prefix="telegram-image-")
             image_path = self.download_image_from_message(image_message, Path(temp_dir_obj.name))
             image_paths.append(str(image_path))
-        cmd = self.build_command(full_prompt, image_paths=image_paths)
+        cmd = self.build_command(full_prompt, image_paths=image_paths, thread_id=thread_before)
         insert_at = len(cmd) - 1
         cmd[insert_at:insert_at] = [output_path]
         self.log_event("CODEX", "Executing Codex request")
@@ -1921,6 +2186,7 @@ class TelegramCodexBridge:
         timeout_reason: str | None = None
         timeout_details: str | None = None
         exact_usage: dict | None = None
+        canceled = False
         self.maybe_update_progress(
             chat_id,
             status_message_id,
@@ -1977,6 +2243,18 @@ class TelegramCodexBridge:
                 last_event_type=last_event_type,
                 last_event_item_type=last_event_item_type,
             )
+            if should_cancel is not None and should_cancel():
+                canceled = True
+                timeout_reason = "Job canceled by user."
+                self.log_event("WARN", timeout_reason)
+                self.maybe_update_progress(
+                    chat_id,
+                    status_message_id,
+                    "Running Codex...\n\nCancel requested. Stopping it now...",
+                    force=True,
+                    state=progress_state,
+                )
+                break
             if elapsed >= self.codex_max_runtime:
                 timeout_reason = (
                     f"Codex exceeded the maximum runtime of {self.codex_max_runtime}s and was stopped."
@@ -2039,7 +2317,8 @@ class TelegramCodexBridge:
         else:
             proc.wait()
         output = "".join(output_lines)
-        self.maybe_capture_thread_id(output)
+        if persist_thread:
+            self.maybe_capture_thread_id(output)
         try:
             message = Path(output_path).read_text().strip()
         finally:
@@ -2050,11 +2329,11 @@ class TelegramCodexBridge:
             timeout_message = timeout_reason
             if timeout_details:
                 timeout_message = f"{timeout_reason}\n\n{timeout_details}"
-            usage = self.finalize_usage(full_prompt, timeout_message, "timeout", exact_usage)
+            usage = self.finalize_usage(full_prompt, timeout_message, "canceled" if canceled else "timeout", exact_usage)
             self.maybe_update_progress(
                 chat_id,
                 status_message_id,
-                "Running Codex...\n\nStopped. Sending timeout details...",
+                "Running Codex...\n\nStopped. Sending final status...",
                 force=True,
                 state=progress_state,
             )

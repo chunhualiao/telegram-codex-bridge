@@ -240,19 +240,26 @@ If that `curl` fails, the bridge will not work.
    If there has been no accepted activity for the configured timeout, the next message must be the configured passphrase before normal commands resume.
 
 9. Handles commands
-   It processes `/start`, `/status`, `/meter`, `/config`, and `/reset` directly.
+   It processes `/start`, `/status`, `/ask`, `/spawn`, `/jobs`, `/cancel`, `/meter`, `/config`, and `/reset` directly.
    Runtime config overrides are stored in `state/runtime_config.json`, except `bridge.passphrase`, which stays in memory only for the current process.
 
-10. Runs Codex
-   For normal text messages it runs local `codex exec`.
+10. Dispatches work
+   Plain prompts are auto-dispatched:
+   short/direct requests stay in the interactive lane
+   longer tuning/batch/iterative requests move to background jobs
+   `/ask` forces interactive and `/spawn` forces background.
 
-11. Persists the Codex thread
-   If Codex emits a `thread.started` JSON event, the script saves that thread ID.
+11. Runs Codex
+   Interactive-lane requests run local `codex exec` against the saved thread when one exists.
+   Background jobs run local `codex exec` in fresh sessions so they do not change the interactive thread.
 
-12. Resumes the thread later
-   On later messages it runs `codex exec resume <thread_id>`.
+12. Persists the interactive thread
+   If Codex emits a `thread.started` JSON event for the interactive lane, the script saves that thread ID.
 
-13. Handles Telegram polling conflicts
+13. Resumes the thread later
+   Later interactive-lane messages run `codex exec resume <thread_id>`.
+
+14. Handles Telegram polling conflicts
    The bridge keeps a machine-wide lock for the Telegram bot token under
    `~/.telegram-bridge-locks/` so different repos cannot poll the same bot at
    the same time on one machine. If Telegram still returns `HTTP 409 Conflict`,
@@ -342,6 +349,9 @@ Response includes:
 Purpose:
 Deletes the saved Codex thread ID so the next message starts a fresh conversation.
 
+This only affects the interactive lane.
+It does not cancel detached background jobs.
+
 Expected response:
 
 ```text
@@ -357,11 +367,17 @@ Typical usage:
 1. Open the Telegram chat with your bot.
 2. Send `/status` if you want to see whether the bridge is already in an active conversation.
 3. Send a normal message in plain English.
-4. Wait for:
+4. The bridge auto-dispatches it:
+   short/direct requests stay interactive
+   longer tuning/batch/iterative requests move to background automatically
+   the bot tells you which route it picked.
+5. Wait for:
    - `Running Codex...`
    - then Codex's actual reply
-5. Send follow-up questions naturally.
-6. If you want a fresh conversation, send `/reset`.
+6. Use `/jobs` to inspect active work or `/cancel <job_id>` to stop one.
+7. Use `/ask <prompt>` to force the interactive lane.
+8. Use `/spawn <prompt>` to force a detached background job.
+9. If you want a fresh interactive conversation, send `/reset`.
 
 Example prompts:
 

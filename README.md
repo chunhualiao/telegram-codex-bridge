@@ -126,9 +126,10 @@ Runtime flow in practice:
 2. `bridge.py` checks the allowed chat/user IDs and the inactivity passphrase gate.
 3. If the message is voice, it is converted with `ffmpeg` and transcribed through the OpenAI transcription API.
 4. If the message includes an image, the image is downloaded and attached to `codex exec --image`.
-5. The bridge launches local `codex exec`, optionally resuming the saved thread ID.
-6. While Codex emits JSON events, the bridge edits the Telegram status message with progress updates.
-7. The final reply is sent back to Telegram, and the bridge records request/token/cost data under `state/usage_meter.json`.
+5. The bridge auto-dispatches the request into either the interactive lane or a detached background job.
+6. Interactive-lane jobs reuse the saved Codex thread ID when available; background jobs run in fresh sessions.
+7. While Codex emits JSON events, the bridge relays progress updates back to Telegram.
+8. The final reply is sent back to Telegram, and the bridge records request/token/cost data under `state/usage_meter.json`.
 
 ## Step-By-Step Setup
 
@@ -393,7 +394,19 @@ Supported Telegram commands:
   Returns a short readiness message.
 
 - `/status`
-  Shows the saved Codex thread ID, if one exists, plus the configured workdir.
+  Shows the saved Codex thread ID, if one exists, whether the interactive lane is busy, and the configured workdir.
+
+- `/ask <prompt>`
+  Forces a request into the interactive lane.
+
+- `/spawn <prompt>`
+  Forces a request into a detached background job.
+
+- `/jobs`
+  Lists active and recent jobs.
+
+- `/cancel <job_id>`
+  Cancels a specific running job. `/cancel` by itself targets the active interactive job.
 
 - `/meter`
   Shows cumulative bridge token counts, how much was exact vs estimated, and estimated API cost when pricing is configured.
@@ -407,14 +420,19 @@ Supported Telegram commands:
 Normal usage:
 
 - Send any plain text request as if you were talking directly to Codex.
+- Plain prompts now auto-dispatch:
+  short/direct requests stay in the interactive lane
+  longer tuning / batch / iterative prompts move to background automatically
+- The bot tells you which routing decision it made.
 - Or send a Telegram voice message.
 - Or send a Telegram photo / image document.
-- Follow-up messages continue the same Codex thread.
+- Interactive-lane follow-up messages continue the same Codex thread.
+- Background jobs use fresh Codex sessions and do not change the interactive thread.
 - Use `/reset` before switching to a completely different task.
 - If you send an image with no caption, the bridge asks Codex to inspect the attached image.
 - If you send an image with a caption, the caption becomes the prompt.
 
-While Codex is running, the bot now tries to relay progress in real time by editing the `Running Codex...` status message with milestones and heartbeat updates.
+While Codex is running, the bot relays progress in real time and remains responsive to `/jobs`, `/cancel`, `/status`, and new detached background work.
 
 Example prompts:
 
