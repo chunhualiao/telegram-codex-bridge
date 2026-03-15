@@ -34,6 +34,9 @@ DEFAULT_POLL_TIMEOUT = 30
 DEFAULT_CONFLICT_EXIT_THRESHOLD = 3
 PRIVATE_DIR_MODE = 0o700
 PRIVATE_FILE_MODE = 0o600
+MAX_INPUT_TOKENS_PER_REQUEST = 5_000_000
+MAX_OUTPUT_TOKENS_PER_REQUEST = 1_000_000
+MAX_TOTAL_TOKENS_PER_REQUEST = 6_000_000
 
 
 def load_env_file(path: Path) -> None:
@@ -1394,6 +1397,113 @@ class TelegramCodexBridge:
             "models": {},
         }
 
+    def archive_invalid_usage_meter(self) -> None:
+        if not getattr(self, "usage_meter_file", None):
+            return
+        if not self.usage_meter_file.exists():
+            return
+        suffix = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        archived = self.usage_meter_file.with_name(f"{self.usage_meter_file.stem}.bad-{suffix}{self.usage_meter_file.suffix}")
+        try:
+            self.usage_meter_file.replace(archived)
+        except OSError:
+            return
+
+    def is_valid_usage_meter_payload(self, payload: dict | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        requests = payload.get("requests")
+        if not isinstance(requests, int) or requests < 0:
+            return False
+        numeric_fields = (
+            "input_tokens",
+            "output_tokens",
+            "exact_input_tokens",
+            "exact_output_tokens",
+            "estimated_input_tokens",
+            "estimated_output_tokens",
+        )
+        for field in numeric_fields:
+            value = payload.get(field)
+            if not isinstance(value, int) or value < 0:
+                return False
+        float_fields = ("input_cost_usd", "output_cost_usd", "updated_at")
+        for field in float_fields:
+            value = payload.get(field)
+            if not isinstance(value, (int, float)) or value < 0:
+                return False
+        if payload["input_tokens"] != payload["exact_input_tokens"] + payload["estimated_input_tokens"]:
+            return False
+        if payload["output_tokens"] != payload["exact_output_tokens"] + payload["estimated_output_tokens"]:
+            return False
+        if requests == 0:
+            return payload["input_tokens"] == 0 and payload["output_tokens"] == 0
+        if payload["input_tokens"] > requests * MAX_INPUT_TOKENS_PER_REQUEST:
+            return False
+        if payload["output_tokens"] > requests * MAX_OUTPUT_TOKENS_PER_REQUEST:
+            return False
+        last_request = payload.get("last_request")
+        if last_request is not None and not self.is_valid_usage_meter_last_request(last_request):
+            return False
+        models = payload.get("models")
+        if not isinstance(models, dict):
+            return False
+        for model_meter in models.values():
+            if not isinstance(model_meter, dict):
+                return False
+            model_requests = model_meter.get("requests")
+            model_input = model_meter.get("input_tokens")
+            model_output = model_meter.get("output_tokens")
+            model_cost = model_meter.get("cost_usd")
+            if not isinstance(model_requests, int) or model_requests < 0:
+                return False
+            if not isinstance(model_input, int) or model_input < 0:
+                return False
+            if not isinstance(model_output, int) or model_output < 0:
+                return False
+            if not isinstance(model_cost, (int, float)) or model_cost < 0:
+                return False
+            if model_requests == 0:
+                if model_input != 0 or model_output != 0:
+                    return False
+                continue
+            if model_input > model_requests * MAX_INPUT_TOKENS_PER_REQUEST:
+                return False
+            if model_output > model_requests * MAX_OUTPUT_TOKENS_PER_REQUEST:
+                return False
+        return True
+
+    def is_valid_usage_meter_last_request(self, payload: dict | None) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        snapshot = self.sanitize_usage_snapshot(
+            {
+                "input_tokens": payload.get("input_tokens"),
+                "output_tokens": payload.get("output_tokens"),
+                "total_tokens": None,
+            }
+        )
+        if snapshot is None:
+            return False
+        for field in (
+            "exact_input_tokens",
+            "exact_output_tokens",
+            "estimated_input_tokens",
+            "estimated_output_tokens",
+        ):
+            value = payload.get(field)
+            if not isinstance(value, int) or value < 0:
+                return False
+        if payload["input_tokens"] != payload["exact_input_tokens"] + payload["estimated_input_tokens"]:
+            return False
+        if payload["output_tokens"] != payload["exact_output_tokens"] + payload["estimated_output_tokens"]:
+            return False
+        for field in ("input_cost_usd", "output_cost_usd", "at"):
+            value = payload.get(field)
+            if not isinstance(value, (int, float)) or value < 0:
+                return False
+        return True
+
     def load_usage_meter(self) -> dict:
         if not self.usage_meter_file.exists():
             return self.default_usage_meter()
@@ -1401,7 +1511,8 @@ class TelegramCodexBridge:
             payload = json.loads(self.usage_meter_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             return self.default_usage_meter()
-        if not isinstance(payload, dict):
+        if not self.is_valid_usage_meter_payload(payload):
+            self.archive_invalid_usage_meter()
             return self.default_usage_meter()
         meter = self.default_usage_meter()
         meter.update(payload)
@@ -1725,11 +1836,11 @@ class TelegramCodexBridge:
                 return None
         # Guard against obviously bogus values from unrelated nested fields.
         # Even very large Codex turns should be far below these thresholds.
-        if input_tokens is not None and input_tokens > 5_000_000:
+        if input_tokens is not None and input_tokens > MAX_INPUT_TOKENS_PER_REQUEST:
             return None
-        if output_tokens is not None and output_tokens > 1_000_000:
+        if output_tokens is not None and output_tokens > MAX_OUTPUT_TOKENS_PER_REQUEST:
             return None
-        if total_tokens is not None and total_tokens > 6_000_000:
+        if total_tokens is not None and total_tokens > MAX_TOTAL_TOKENS_PER_REQUEST:
             return None
         return snapshot
 
@@ -1772,6 +1883,7 @@ class TelegramCodexBridge:
         return best
 
     def finalize_usage(self, prompt: str, response_text: str, outcome: str, exact_usage: dict | None) -> dict:
+        exact_usage = self.sanitize_usage_snapshot(exact_usage)
         estimated_input_tokens = self.estimate_tokens(prompt)
         estimated_output_tokens = self.estimate_tokens(response_text)
         exact_input_tokens = (exact_usage or {}).get("input_tokens")

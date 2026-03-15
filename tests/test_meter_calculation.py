@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from tests.support import make_bridge
 
@@ -152,6 +154,90 @@ class FinalizeUsageTests(unittest.TestCase):
         self.assertEqual(usage["estimated_output_tokens"], 222)
         self.assertAlmostEqual(usage["input_cost_usd"], 0.0001665)
         self.assertAlmostEqual(usage["output_cost_usd"], 0.001332)
+
+    def test_finalize_usage_rejects_bogus_exact_counts_and_falls_back_to_estimates(self) -> None:
+        bridge = make_bridge()
+
+        def fake_estimate(text: str) -> int:
+            return {
+                "synthetic prompt": 111,
+                "synthetic response": 222,
+            }[text]
+
+        bridge.estimate_tokens = fake_estimate
+        bridge.get_pricing_model_name = lambda: "anonymized-model"
+        bridge.resolve_pricing = lambda model: {
+            "input_per_million": 1.5,
+            "output_per_million": 6.0,
+            "source": "unit-test",
+            "url": "",
+        }
+
+        usage = bridge.finalize_usage(
+            prompt="synthetic prompt",
+            response_text="synthetic response",
+            outcome="ok",
+            exact_usage={"input_tokens": 81_709_876, "output_tokens": 288_360},
+        )
+
+        self.assertEqual(usage["input_tokens"], 111)
+        self.assertEqual(usage["output_tokens"], 222)
+        self.assertEqual(usage["exact_input_tokens"], 0)
+        self.assertEqual(usage["exact_output_tokens"], 0)
+        self.assertEqual(usage["estimated_input_tokens"], 111)
+        self.assertEqual(usage["estimated_output_tokens"], 222)
+
+
+class UsageMeterPersistenceTests(unittest.TestCase):
+    def test_load_usage_meter_archives_invalid_meter_and_resets_to_default(self) -> None:
+        bridge = make_bridge()
+        with TemporaryDirectory() as temp_dir:
+            usage_meter_file = Path(temp_dir) / "usage_meter.json"
+            usage_meter_file.write_text(
+                """
+{
+  "requests": 16,
+  "input_tokens": 1198326455,
+  "output_tokens": 4320725,
+  "exact_input_tokens": 1198326455,
+  "exact_output_tokens": 4320725,
+  "estimated_input_tokens": 0,
+  "estimated_output_tokens": 0,
+  "input_cost_usd": 3060.627013,
+  "output_cost_usd": 0.0,
+  "updated_at": 1773400000.0,
+  "last_request": {
+    "at": 1773400000.0,
+    "input_tokens": 81499836,
+    "output_tokens": 288335,
+    "exact_input_tokens": 81499836,
+    "exact_output_tokens": 288335,
+    "estimated_input_tokens": 0,
+    "estimated_output_tokens": 0,
+    "input_cost_usd": 208.074615,
+    "output_cost_usd": 0.0
+  },
+  "models": {
+    "gpt-5.4": {
+      "requests": 16,
+      "input_tokens": 1198326455,
+      "output_tokens": 4320725,
+      "cost_usd": 3060.627013,
+      "pricing_source": "openrouter"
+    }
+  }
+}
+""".strip(),
+                encoding="utf-8",
+            )
+            bridge.usage_meter_file = usage_meter_file
+
+            meter = bridge.load_usage_meter()
+
+            self.assertEqual(meter, bridge.default_usage_meter())
+            archived = list(Path(temp_dir).glob("usage_meter.bad-*.json"))
+            self.assertEqual(len(archived), 1)
+            self.assertFalse(usage_meter_file.exists())
 
 
 if __name__ == "__main__":
