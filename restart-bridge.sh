@@ -37,19 +37,67 @@ trim_quotes() {
   printf '%s' "$value"
 }
 
-telegram_lock_file() {
+env_value() {
+  local key="$1"
   if [[ ! -f "$ENV_FILE" ]]; then
     return 0
   fi
+  local value
+  value="$(grep -E "^${key}=" "$ENV_FILE" | head -n 1 | cut -d= -f2- || true)"
+  trim_quotes "$value"
+}
+
+telegram_lock_file() {
   local token
-  token="$(grep -E '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | head -n 1 | cut -d= -f2- || true)"
-  token="$(trim_quotes "$token")"
+  token="$(env_value "TELEGRAM_BOT_TOKEN")"
   if [[ -z "$token" ]]; then
     return 0
   fi
   local fingerprint
   fingerprint="$(printf '%s' "$token" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
   printf '%s/.telegram-bridge-locks/%s.lock\n' "$HOME" "$fingerprint"
+}
+
+telegram_pre_restart_notice() {
+  local token chat_id text
+  token="$(env_value "TELEGRAM_BOT_TOKEN")"
+  chat_id="$(env_value "TELEGRAM_ALLOWED_CHAT_ID")"
+  text="Bridge restarting now. Expect a brief offline window."
+  if [[ -z "$token" || -z "$chat_id" ]]; then
+    log "Skipping pre-restart Telegram notice because TELEGRAM_BOT_TOKEN or TELEGRAM_ALLOWED_CHAT_ID is missing."
+    return 0
+  fi
+  python3 - "$token" "$chat_id" "$text" <<'PY'
+import json
+import sys
+import urllib.parse
+import urllib.request
+
+token, chat_id, text = sys.argv[1:4]
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+req = urllib.request.Request(url, data=data, method="POST")
+with urllib.request.urlopen(req, timeout=20) as response:
+    payload = json.loads(response.read().decode())
+    if not payload.get("ok"):
+        raise SystemExit("telegram notice failed")
+PY
+}
+
+verify_running_pid() {
+  if [[ ! -f "$LOCAL_LOCK_FILE" ]]; then
+    return 1
+  fi
+  local pid
+  pid="$(cat "$LOCAL_LOCK_FILE")"
+  [[ -n "$pid" ]] || return 1
+  ps -p "$pid" >/dev/null 2>&1
+}
+
+emergency_start_bridge() {
+  log "LaunchAgent restart did not yield a live bridge. Starting emergency fallback via run-bridge.sh"
+  nohup "$RUN_SCRIPT" >> "$STATE_DIR/stdout.log" 2>> "$STATE_DIR/stderr.log" </dev/null &
+  sleep 3
 }
 
 match_plists=()
@@ -90,6 +138,9 @@ if [[ -z "$canonical_label" ]]; then
 fi
 
 log "Canonical LaunchAgent: $canonical_label"
+
+log "Sending pre-restart Telegram notice"
+telegram_pre_restart_notice || log "Pre-restart Telegram notice failed"
 
 for plist in "${repo_plists[@]}"; do
   label="$(plist_label "$plist")"
@@ -150,8 +201,15 @@ sleep 2
 log "LaunchAgent status:"
 launchctl print "gui/$(id -u)/$canonical_label" | sed -n '1,40p'
 
-if [[ -f "$LOCAL_LOCK_FILE" ]]; then
-  log "Current bridge.lock PID: $(cat "$LOCAL_LOCK_FILE")"
-else
-  log "Warning: $LOCAL_LOCK_FILE was not recreated yet."
+if ! verify_running_pid; then
+  emergency_start_bridge
 fi
+
+if ! verify_running_pid; then
+  log "ERROR: bridge still not running after LaunchAgent restart and emergency fallback."
+  exit 1
+fi
+
+NEW_PID="$(cat "$LOCAL_LOCK_FILE")"
+log "Current bridge.lock PID: $NEW_PID"
+log "Restart completed successfully"

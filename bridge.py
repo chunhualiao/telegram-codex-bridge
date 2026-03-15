@@ -1059,18 +1059,19 @@ class TelegramCodexBridge:
             raise RuntimeError(f"Restart script not found: {restart_script}")
         env = os.environ.copy()
         env["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{env.get('PATH', '')}"
-        log_handle = open(self.restart_log_file, "a", encoding="utf-8")
         self.harden_file_permissions(self.restart_log_file)
-        subprocess.Popen(
-            ["/bin/bash", str(restart_script)],
-            cwd=str(BASE_DIR),
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env=env,
-        )
-        log_handle.close()
+        with open(self.restart_log_file, "a", encoding="utf-8") as log_handle:
+            proc = subprocess.Popen(
+                ["/bin/bash", str(restart_script)],
+                cwd=str(BASE_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                env=env,
+            )
+            log_handle.write(f"[bridge] spawned restart helper pid={getattr(proc, 'pid', 'unknown')}\n")
+            log_handle.flush()
 
     def is_restart_request(self, text: str) -> bool:
         normalized = " ".join(text.strip().lower().split())
