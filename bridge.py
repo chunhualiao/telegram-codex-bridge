@@ -108,6 +108,7 @@ class TelegramCodexBridge:
         self.lock_notice_file = STATE_DIR / "lock_notice.txt"
         self.pending_message_file = STATE_DIR / "pending_message.json"
         self.transcript_file = STATE_DIR / "conversation.log"
+        self.restart_log_file = STATE_DIR / "restart.log"
         self.usage_meter_file = STATE_DIR / "usage_meter.json"
         self.pricing_cache_file = STATE_DIR / "pricing_cache.json"
         self.runtime_config_file = STATE_DIR / "runtime_config.json"
@@ -168,6 +169,7 @@ class TelegramCodexBridge:
             self.lock_notice_file,
             self.pending_message_file,
             self.transcript_file,
+            self.restart_log_file,
             self.usage_meter_file,
             self.pricing_cache_file,
             self.runtime_config_file,
@@ -1047,6 +1049,63 @@ class TelegramCodexBridge:
                 return False
             job["cancel_requested"] = True
             return True
+
+    def schedule_restart(self) -> None:
+        restart_script = BASE_DIR / "restart-bridge.sh"
+        if not restart_script.exists():
+            raise RuntimeError(f"Restart script not found: {restart_script}")
+        env = os.environ.copy()
+        env["PATH"] = f"/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:{env.get('PATH', '')}"
+        log_handle = open(self.restart_log_file, "a", encoding="utf-8")
+        self.harden_file_permissions(self.restart_log_file)
+        subprocess.Popen(
+            ["/bin/bash", str(restart_script)],
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+        log_handle.close()
+
+    def is_restart_request(self, text: str) -> bool:
+        normalized = " ".join(text.strip().lower().split())
+        if not normalized:
+            return False
+        direct_triggers = {
+            "/restart",
+            "restart",
+            "restart bridge",
+            "restart the bridge",
+            "restart the bot",
+            "restart the telegram bridge",
+            "run restart-bridge.sh",
+            "run ./restart-bridge.sh",
+            "run the restart sh",
+            "run the restart script",
+        }
+        if normalized in direct_triggers:
+            return True
+        if "restart-bridge.sh" in normalized:
+            return True
+        if "restart" in normalized and any(term in normalized for term in ("bridge", "bot", "service", "launchagent")):
+            return True
+        if normalized.startswith("run ") and "restart" in normalized and (" sh" in normalized or " script" in normalized):
+            return True
+        return False
+
+    def handle_restart_request(self, chat_id: str) -> None:
+        self.save_last_activity()
+        self.send_message(
+            chat_id,
+            "Scheduling a detached bridge restart. Expect a fresh 'Telegram Codex bridge is online.' message shortly.",
+        )
+        try:
+            self.schedule_restart()
+        except Exception as exc:
+            self.log_event("ERROR", f"Failed to schedule detached restart: {exc}")
+            self.send_message(chat_id, f"Failed to schedule restart.\n\n{exc}")
 
     def effective_codex_flags(self) -> list[str]:
         flags = list(self.codex_flags)
@@ -2021,6 +2080,9 @@ class TelegramCodexBridge:
         if text == "/meter":
             self.save_last_activity()
             self.send_message(chat_id, self.format_usage_report())
+            return
+        if self.is_restart_request(text):
+            self.handle_restart_request(chat_id)
             return
         if text == "/reset":
             active_job_id = self.get_active_interactive_job_id()

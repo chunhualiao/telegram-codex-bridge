@@ -411,6 +411,10 @@ Supported Telegram commands:
 - `/meter`
   Shows cumulative bridge token counts, how much was exact vs estimated, and estimated API cost when pricing is configured.
 
+- `/restart`
+  Schedules a detached bridge restart without asking Codex to kill the service from inside the active request.
+  Natural-language restart requests like `run restart-bridge.sh`, `run the restart sh`, or `restart the bridge` are routed here too.
+
 - `/config`
   Opens the runtime config menu. Use `/config list`, `/config show <key>`, `/config set <key> <value>`, `/config unset <key>`, `/config menu <section>`, or `/config reset`.
 
@@ -433,6 +437,8 @@ Normal usage:
 - If you send an image with a caption, the caption becomes the prompt.
 
 While Codex is running, the bot relays progress in real time and remains responsive to `/jobs`, `/cancel`, `/status`, and new detached background work.
+
+For bridge maintenance, prefer `/restart` inside Telegram instead of asking Codex to run `./restart-bridge.sh` as a normal task. The dedicated command detaches the restart helper first, then lets the current bridge process be replaced safely.
 
 Example prompts:
 
@@ -524,6 +530,8 @@ This script:
 - removes stale `state/bridge.lock`
 - removes the matching machine-wide Telegram token lock
 - bootstraps and kickstarts the canonical LaunchAgent again
+
+Inside Telegram, use `/restart` for the same operation. It schedules this script in a detached child process so the current bridge can restart itself without tearing down the active request mid-flight.
 
 ## How To Stop The Bridge
 

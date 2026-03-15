@@ -140,7 +140,7 @@ for plist in "${repo_plists[@]}"; do
 done
 
 log "Bootstrapping $canonical_label"
-launchctl bootstrap "gui/$(id -u)" "$canonical_plist" >/dev/null 2>&1 || true
+launchctl bootstrap "gui/$(id -u)" "$canonical_plist"
 
 log "Kickstarting $canonical_label"
 launchctl kickstart -k "gui/$(id -u)/$canonical_label"
