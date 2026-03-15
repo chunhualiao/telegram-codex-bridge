@@ -207,6 +207,35 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
         self.assertIn("Recent output tail: none", diagnostics)
 
 
+class PollingErrorClassificationTests(unittest.TestCase):
+    def test_transient_polling_error_detects_connection_reset(self) -> None:
+        bridge = make_bridge()
+
+        self.assertTrue(
+            bridge.is_transient_polling_error(
+                urllib.error.URLError("[Errno 54] Connection reset by peer")
+            )
+        )
+
+    def test_transient_polling_error_detects_no_route_to_host(self) -> None:
+        bridge = make_bridge()
+
+        self.assertTrue(
+            bridge.is_transient_polling_error(
+                urllib.error.URLError("[Errno 65] No route to host")
+            )
+        )
+
+    def test_transient_polling_error_rejects_non_network_messages(self) -> None:
+        bridge = make_bridge()
+
+        self.assertFalse(
+            bridge.is_transient_polling_error(
+                urllib.error.URLError("certificate verify failed")
+            )
+        )
+
+
 class OpsecTests(unittest.TestCase):
     def test_sanitize_sensitive_text_redacts_tokens_and_bearer_headers(self) -> None:
         bridge = make_bridge()

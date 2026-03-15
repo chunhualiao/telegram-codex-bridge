@@ -1072,6 +1072,20 @@ class TelegramCodexBridge:
             return "/config set bridge.passphrase [redacted]"
         return text
 
+    def is_transient_polling_error(self, exc: Exception) -> bool:
+        text = str(exc).lower()
+        transient_markers = (
+            "timed out",
+            "timeout",
+            "connection reset by peer",
+            "errno 54",
+            "no route to host",
+            "errno 65",
+            "handshake operation timed out",
+            "temporarily unavailable",
+        )
+        return any(marker in text for marker in transient_markers)
+
     def run(self) -> None:
         self.acquire_lock()
         self.reset_unlock_state_for_restart()
@@ -1102,6 +1116,10 @@ class TelegramCodexBridge:
                         )
                     time.sleep(5)
                     continue
+                if 500 <= exc.code < 600:
+                    self.log_event("WARN", f"Telegram polling HTTP error {exc.code}: {exc}. Retrying.")
+                    time.sleep(5)
+                    continue
                 self.log_event("ERROR", f"Telegram polling failed: {exc}")
                 self.send_message(self.allowed_chat_id, f"Bridge error: {exc}")
                 time.sleep(5)
@@ -1110,8 +1128,8 @@ class TelegramCodexBridge:
                 time.sleep(5)
                 continue
             except urllib.error.URLError as exc:
-                if "timed out" in str(exc).lower():
-                    self.log_event("WARN", f"Telegram polling timed out: {exc}. Retrying.")
+                if self.is_transient_polling_error(exc):
+                    self.log_event("WARN", f"Telegram polling transient network error: {exc}. Retrying.")
                     time.sleep(5)
                     continue
                 self.log_event("ERROR", f"Telegram polling URL error: {exc}")
