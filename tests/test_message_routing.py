@@ -1,4 +1,5 @@
 import unittest
+import threading
 
 from tests.support import make_configured_bridge
 
@@ -122,6 +123,52 @@ class MessageRoutingTests(unittest.TestCase):
 
         self.assertIsNone(job_id)
         self.assertIn("Interactive lane is busy with job-1", message)
+
+    def test_run_codex_job_worker_completes_without_jobs_lock_deadlock(self) -> None:
+        bridge = make_configured_bridge()
+        bridge.jobs["job-1"] = {
+            "id": "job-1",
+            "kind": "interactive",
+            "status": "queued",
+            "chat_id": "chat-1",
+            "prompt_preview": "hello",
+            "cancel_requested": False,
+            "result_preview": "",
+        }
+        bridge.interactive_job_id = "job-1"
+        bridge.send_message = lambda chat_id, text, reply_markup=None: 1
+        bridge.load_thread_id = lambda: None
+        bridge.run_codex = lambda *args, **kwargs: (
+            "reply",
+            {
+                "model": "gpt-test",
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "exact_input_tokens": 1,
+                "exact_output_tokens": 1,
+                "estimated_input_tokens": 0,
+                "estimated_output_tokens": 0,
+                "input_cost_usd": 0.0,
+                "output_cost_usd": 0.0,
+                "outcome": "ok",
+                "pricing_source": "manual",
+                "pricing_url": "",
+            },
+        )
+        bridge.record_usage = lambda usage: None
+        bridge.log_event = lambda *args, **kwargs: None
+
+        worker = threading.Thread(
+            target=bridge.run_codex_job_worker,
+            args=("job-1", "hello", None),
+            daemon=True,
+        )
+        worker.start()
+        worker.join(timeout=0.5)
+
+        self.assertFalse(worker.is_alive(), "worker thread deadlocked on jobs_lock")
+        self.assertEqual(bridge.jobs["job-1"]["status"], "completed")
+        self.assertEqual(bridge.interactive_job_id, None)
 
 
 if __name__ == "__main__":
